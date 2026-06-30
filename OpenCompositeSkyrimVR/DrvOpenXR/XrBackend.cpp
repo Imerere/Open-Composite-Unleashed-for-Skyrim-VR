@@ -1948,7 +1948,10 @@ void XrBackend::PumpEvents()
 
 		if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
 			auto* changed = (XrEventDataSessionStateChanged*)&ev;
-			OOVR_FALSE_ABORT(changed->session == xr_session.get());
+			// Monado bug, it tags new session startup events with the old session handle so here we just accept it anyway
+			if (changed->session != xr_session.get()) {
+				OOVR_LOGF("PumpEvents: session handle mismatch - accepting anyway");
+			}
 			sessionState = changed->state;
 
 			// Monado bug: it returns 0 for this value (at least for the first two states)

@@ -39,6 +39,13 @@ using namespace vr;
 
 SmoothInput BaseInput::smoothInput(oovr_global_configuration.InputWindowSize());
 
+// Trackpad state exported for the VR keyboard swipe shortcut and the gesture
+// recognizer (BaseOverlay reads these each frame). Zero on controllers
+// without a trackpad.
+float g_ocuTrackpadY[2] = { 0.0f, 0.0f };
+bool g_ocuTrackpadTouch[2] = { false, false };
+bool g_ocuTrackpadClick[2] = { false, false };
+
 /**
  * Macro for creating an Action object from a handle and verifying isn't invalid.
  * If it is invalid, it will cause the surrounding function to return VRInputError_InvalidHandle.
@@ -2477,6 +2484,20 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 		OOVR_FAILED_XR_ABORT(xrGetActionStateBoolean(xr_session.get(), &getInfo, &as));
 		return as.isActive ? as.currentState : false;
 	};
+
+	// Trackpad state exported for the VR keyboard swipe shortcut and gesture
+	// recognizer (BaseOverlay). On controllers without a trackpad the actions
+	// are null and these stay 0.
+	{
+		extern float g_ocuTrackpadY[2];
+		extern bool g_ocuTrackpadTouch[2];
+		extern bool g_ocuTrackpadClick[2];
+		if (hand >= 0 && hand <= 1) {
+			g_ocuTrackpadTouch[hand] = readBool(ctrl.trackPadTouch);
+			g_ocuTrackpadY[hand] = readFloat(ctrl.trackPadY);
+			g_ocuTrackpadClick[hand] = readBool(ctrl.trackPadClick);
+		}
+	}
 
 	// this chunk needs to be disabled if we want to use knuckles trackpad click for VRIK gestures
 	if (!enableVRIKKnucklesTrackPadSupport && !oovr_global_configuration.DisableTrackPad() && ctrl.trackPadClick && ctrl.trackPadY) {

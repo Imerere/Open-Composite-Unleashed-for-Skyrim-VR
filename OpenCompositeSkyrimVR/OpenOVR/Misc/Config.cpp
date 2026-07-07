@@ -386,6 +386,12 @@ int Config::ini_handler(void* user, const char* pSection,
 		if (name == "shortcutButton") { cfg->kbShortcutButton = parse_string(value, name, lineno); return true; }
 		if (name == "shortcutMode") { cfg->kbShortcutMode = parse_string(value, name, lineno); return true; }
 		if (name == "shortcutTiming") { cfg->kbShortcutTiming = parse_int(value, name, lineno); return true; }
+		if (name == "shortcutTrackpad") { cfg->kbShortcutTrackpad = parse_string(value, name, lineno); return true; }
+		if (name == "gesturesEnabled") { cfg->kbGesturesEnabled = parse_bool(value, name, lineno); return true; }
+		if (name == "gestureThreshold") { cfg->kbGestureThreshold = parse_float(value, name, lineno); return true; }
+		if (name == "gestureSounds") { cfg->kbGestureSounds = parse_bool(value, name, lineno); return true; }
+		if (name == "gestureFinishSound") { cfg->kbGestureFinishSound = parse_string(value, name, lineno); return true; }
+		if (name == "gestureArmHeight") { cfg->kbGestureArmHeight = parse_float(value, name, lineno); return true; }
 		if (name == "displayTilt") { cfg->kbDisplayTilt = parse_float(value, name, lineno); return true; }
 		if (name == "displayOpacity") { cfg->kbDisplayOpacity = parse_int(value, name, lineno); return true; }
 		if (name == "displayScale") { cfg->kbDisplayScale = parse_int(value, name, lineno); return true; }

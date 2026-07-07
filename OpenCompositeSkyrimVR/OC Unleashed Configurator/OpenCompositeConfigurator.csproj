@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Resources\controllers.png" />
+    <EmbeddedResource Include="Resources\knuckles.png" />
     <EmbeddedResource Include="Resources\kofi.png" />
     <EmbeddedResource Include="Resources\Bluefox.png" />
     <EmbeddedResource Include="Resources\FO4Fox.png" />

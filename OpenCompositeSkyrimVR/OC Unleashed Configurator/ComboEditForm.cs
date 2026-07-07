@@ -156,9 +156,30 @@ namespace OpenCompositeConfigurator
             { "right_stick_right", ("\u25B6",   new PointF(0.713f + 0.045f, 0.147f), true) },
         };
 
+        // Set by MainForm before opening so this popup mirrors the controller
+        // model chosen on the Bindings tab (photo + calibrated dot positions).
+        public static string ControllerModelKey = "touch";
+        public static Dictionary<string, PointF>? ModelPositionOverrides;
+
+        // Instance copy of the layout, with model overrides applied
+        private readonly Dictionary<string, (string display, PointF pos, bool isStickDir)> _buttons;
+
+        private static bool IsFullSizeKey(string key) => key.Contains("grip") || key.Contains("trigger");
+
         public ComboEditForm(Dictionary<string, int> keyScancodes, ComboEntry? existing = null)
         {
             _keyScancodes = keyScancodes;
+
+            _buttons = ComboButtons.ToDictionary(kv => kv.Key, kv => kv.Value);
+            if (ModelPositionOverrides != null)
+            {
+                foreach (var kv in ModelPositionOverrides)
+                {
+                    if (_buttons.TryGetValue(kv.Key, out var entry))
+                        _buttons[kv.Key] = (entry.display, kv.Value, entry.isStickDir);
+                }
+            }
+
             LoadControllerImage();
             InitializeUI();
 
@@ -169,7 +190,10 @@ namespace OpenCompositeConfigurator
         private void LoadControllerImage()
         {
             var assembly = Assembly.GetExecutingAssembly();
-            using var stream = assembly.GetManifestResourceStream("OpenCompositeConfigurator.Resources.controllers.png");
+            string resource = ControllerModelKey == "knuckles"
+                ? "OpenCompositeConfigurator.Resources.knuckles.png"
+                : "OpenCompositeConfigurator.Resources.controllers.png";
+            using var stream = assembly.GetManifestResourceStream(resource);
             if (stream != null)
                 _controllerImage = Image.FromStream(stream);
         }
@@ -423,7 +447,7 @@ namespace OpenCompositeConfigurator
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var (drawW, drawH, offX, offY) = GetImageBounds();
 
-            foreach (var kvp in ComboButtons)
+            foreach (var kvp in _buttons)
             {
                 float cx = offX + kvp.Value.pos.X * drawW;
                 float cy = offY + kvp.Value.pos.Y * drawH;
@@ -462,8 +486,9 @@ namespace OpenCompositeConfigurator
                 }
                 else
                 {
-                    // Regular buttons: circles
-                    float r = 14f;
+                    // Regular buttons: circles. Knuckles face buttons are half
+                    // size (tight cluster); grips and triggers stay full size.
+                    float r = ControllerModelKey == "knuckles" && !IsFullSizeKey(kvp.Key) ? 7f : 14f;
 
                     // Ghost circle (always visible)
                     using (var ghostPen = new Pen(Color.FromArgb(50, 255, 255, 255), 1.5f))
@@ -492,10 +517,11 @@ namespace OpenCompositeConfigurator
                 // Label on hover or selection (non-directional buttons only)
                 if ((isHovered || isSelected) && !isDir)
                 {
+                    float lr = ControllerModelKey == "knuckles" && !IsFullSizeKey(kvp.Key) ? 7f : 14f;
                     using var font = new Font("Segoe UI", 7f, FontStyle.Bold);
                     using var textBrush = new SolidBrush(Color.White);
                     var sf = new StringFormat { Alignment = StringAlignment.Center };
-                    g.DrawString(kvp.Value.display, font, textBrush, cx, cy + 14f + 2, sf);
+                    g.DrawString(kvp.Value.display, font, textBrush, cx, cy + lr + 2, sf);
                 }
             }
         }
@@ -504,9 +530,11 @@ namespace OpenCompositeConfigurator
         {
             string? closest = null;
             float closestDist = float.MaxValue;
-            foreach (var kvp in ComboButtons)
+            foreach (var kvp in _buttons)
             {
-                float hitRadius = kvp.Value.isStickDir ? 0.025f : 0.04f;
+                float hitRadius = ControllerModelKey == "knuckles" && !IsFullSizeKey(kvp.Key)
+                    ? (kvp.Value.isStickDir ? 0.018f : 0.026f)
+                    : (kvp.Value.isStickDir ? 0.025f : 0.04f);
                 float dx = fx - kvp.Value.pos.X;
                 float dy = fy - kvp.Value.pos.Y;
                 float dist = (float)Math.Sqrt(dx * dx + dy * dy);
@@ -578,7 +606,7 @@ namespace OpenCompositeConfigurator
             else
             {
                 string buttons = string.Join(" + ", _selectedButtons.Select(b =>
-                    ComboButtons.TryGetValue(b, out var info) ? info.display : b));
+                    _buttons.TryGetValue(b, out var info) ? info.display : b));
                 _lblPreview.Text = buttons;
                 _lblPreview.ForeColor = Color.FromArgb(255, 200, 40);
             }

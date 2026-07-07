@@ -88,6 +88,29 @@ static std::vector<char> s_pressSoundData;
 // Target mode (persists across keyboard open/close)
 static bool s_targetMode = false;
 
+// After a local tilde toggle, hold off the bridge console-state sync briefly:
+// the console request needs a few game frames before MenuOpenCloseEvent
+// updates the bridge, and syncing inside that window would undo the toggle.
+static ULONGLONG s_consoleToggleGraceUntil = 0;
+
+// Custom message the SKSE plugin handles (same id as the keyboard-done signal).
+// wParam 2 = show game console, 3 = hide game console, via the UI queue.
+// Idempotent show/hide replaces injected tilde keystrokes, which double-toggled
+// on setups where DirectInput and message-loop mods both saw the keystroke.
+static constexpr UINT WM_OC_KB_MSG = WM_APP + 0x4F43;
+
+// Ask the SKSE plugin to show/hide the console. Returns false when the game
+// window is unavailable (no plugin path); caller falls back to keystrokes.
+static HWND GetGameWindow();
+static bool RequestGameConsole(bool show)
+{
+	HWND hwnd = GetGameWindow();
+	if (!hwnd)
+		return false;
+	PostMessageW(hwnd, WM_OC_KB_MSG, show ? 2 : 3, 0);
+	return true;
+}
+
 // Sound functions moved after loadResource() definition (see below)
 
 static void TriggerHaptic(int side)
@@ -1988,6 +2011,35 @@ const std::vector<XrCompositionLayerBaseHeader*>& VRKeyboard::Update()
 			consoleDirty = true; // keyboard text changed, update console overlay
 	}
 
+	// Sync the console overlay to the REAL game console state (SKSE bridge).
+	// The old design blind-toggled consoleActive on tilde and hoped every
+	// keystroke landed; one lost/doubled toggle inverted the two state machines
+	// permanently (overlay open + console closed, or the reverse). With the
+	// bridge as source of truth the overlay self-corrects within a frame.
+	// Bridge returns -1 when unavailable (no SKSE plugin / other games) and
+	// the local toggle keeps working as before.
+	if (GetTickCount64() >= s_consoleToggleGraceUntil) {
+		extern int OCBridge_ConsoleState();
+		int gameConsole = OCBridge_ConsoleState();
+		// One-shot diagnostic: says whether the bridge console state is live
+		// (-1 = bridge unavailable, 0/1 = real console state)
+		static bool s_loggedBridgeProbe = false;
+		if (!s_loggedBridgeProbe) {
+			s_loggedBridgeProbe = true;
+			OOVR_LOGF("Console sync: first bridge probe = %d", gameConsole);
+		}
+		if (gameConsole >= 0 && (gameConsole != 0) != consoleActive) {
+			consoleActive = (gameConsole != 0);
+			if (consoleActive) {
+				text.clear();
+				cursorPos = 0;
+			}
+			consoleDirty = true;
+			OOVR_LOGF("Console overlay synced to game console state: %s",
+			    consoleActive ? "OPEN" : "CLOSED");
+		}
+	}
+
 	// Console INPUT overlay — position above keyboard, refresh when needed
 	if (consoleActive && consoleChain != XR_NULL_HANDLE) {
 		// Position directly above the keyboard with a small gap
@@ -2349,14 +2401,17 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 #undef GET_BTTN_LAST
 
 	if (grip && !grip_last && !grabActive) {
-		// If console overlay is active, send tilde to close it in-game too
+		// If console overlay is active, close the real console too
 		if (consoleActive) {
-			VkMapping mapping = CharToVK(L'`');
-			if (mapping.vk != 0)
-				SendVirtualKey(mapping.vk, mapping.needsShift, 0, true, sendInputOnly || consoleActive);
+			if (!RequestGameConsole(false)) {
+				VkMapping mapping = CharToVK(L'`');
+				if (mapping.vk != 0)
+					SendVirtualKey(mapping.vk, mapping.needsShift, 0, true, sendInputOnly || consoleActive);
+			}
 			consoleActive = false;
+			s_consoleToggleGraceUntil = GetTickCount64() + 700;
 			consoleDirty = true;
-			OOVR_LOG("Grip pressed with console open — sent tilde to close console");
+			OOVR_LOG("Grip pressed with console open — requested console hide");
 		}
 		if (!sendInputOnly) {
 			// Send Escape to dismiss SkyUI text input dialogs (only when game opened the keyboard)
@@ -2518,14 +2573,18 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 				// Tilde/backtick toggles console INPUT overlay
 				if (ch == L'`' || ch == L'~') {
 					consoleActive = !consoleActive;
+					s_consoleToggleGraceUntil = GetTickCount64() + 700;
 					if (consoleActive) {
 						text.clear();
 						cursorPos = 0;
 					}
 					consoleDirty = true;
 					OOVR_LOGF("Console overlay: %s", consoleActive ? "OPENED" : "CLOSED");
-					// Send scancode for DirectInput console toggle (no VK, no PostCharToGame)
-					SendSingleVK(VK_OEM_3, sendInputOnly || consoleActive);
+					// Explicit show/hide via the SKSE plugin (idempotent, no
+					// keystroke, immune to double-toggle). Keystroke fallback
+					// only when the plugin window is unavailable.
+					if (!RequestGameConsole(consoleActive))
+						SendSingleVK(VK_OEM_3, sendInputOnly || consoleActive);
 				} else if (consoleActive) {
 					// Console mode: ONLY PostCharToGame — no scancodes at all.
 					// Scancodes produce WM_CHAR via TranslateMessage which doubles in console.

@@ -376,6 +376,13 @@ bool Fsr3Upscaler::EnsureSharedTextures(uint32_t renderW, uint32_t renderH,
 			        &e.outputDX12[buf], &e.outputDX11[buf], &e.outputHandle[buf]))
 				return false;
 		}
+
+		// ASW warp output: single buffer (dispatch is synchronous). Kept separate
+		// from the game output — sharing one buffer let synthetic-frame dispatches
+		// clobber the game frame ASW caches, producing double vision.
+		if (!CreateSharedTexture(outputW, outputH, colorFormat, true,
+		        &e.warpOutputDX12, &e.warpOutputDX11, &e.warpOutputHandle))
+			return false;
 	}
 
 	OOVR_LOGF("FSR3: Shared textures created — render=%ux%u output=%ux%u fmt=%u",
@@ -393,6 +400,7 @@ void Fsr3Upscaler::DestroySharedTextures()
 		DestroySharedTexture(&e.reactiveDX12, &e.reactiveDX11, &e.reactiveHandle);
 		for (int buf = 0; buf < 2; buf++)
 			DestroySharedTexture(&e.outputDX12[buf], &e.outputDX11[buf], &e.outputHandle[buf]);
+		DestroySharedTexture(&e.warpOutputDX12, &e.warpOutputDX11, &e.warpOutputHandle);
 
 		// Reset async pipeline state
 		m_outputWrite[eye] = 0;
@@ -718,9 +726,12 @@ bool Fsr3Upscaler::DispatchInternal(int eyeIdx, ID3D11DeviceContext* d3d11Ctx,
 		dispatchDesc.transparencyAndComposition = dispatchDesc.reactive;
 	}
 
-	// Output resource — write to the current write buffer (double-buffered)
+	// Output resource — game dispatches use the double-buffered game output;
+	// warp dispatches write to their own buffer so GetOutputDX11 keeps returning
+	// the last real game frame (see SharedEyeTextures::warpOutput*).
 	dispatchDesc.output = ffxApiGetResourceDX12(
-	    eye.outputDX12[writeBuf], FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
+	    warpContext ? eye.warpOutputDX12 : eye.outputDX12[writeBuf],
+	    FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
 
 	// Jitter and motion vector parameters
 	dispatchDesc.jitterOffset = { params.jitterX, params.jitterY };
@@ -800,8 +811,11 @@ bool Fsr3Upscaler::DispatchInternal(int eyeIdx, ID3D11DeviceContext* d3d11Ctx,
 
 	// Output is in outputDX12[writeBuf] / outputDX11[writeBuf] — ready to read immediately
 	// (No double-buffering for now: always read what we just wrote)
-	m_outputWrite[eyeIdx] = writeBuf; // Keep pointing to current buffer for GetOutputDX11
-	m_hasOutput[eyeIdx] = true;
+	// Warp dispatches must not touch game-output bookkeeping.
+	if (!warpContext) {
+		m_outputWrite[eyeIdx] = writeBuf; // Keep pointing to current buffer for GetOutputDX11
+		m_hasOutput[eyeIdx] = true;
+	}
 	return true;
 }
 
@@ -810,6 +824,12 @@ ID3D11Texture2D* Fsr3Upscaler::GetOutputDX11(int eyeIdx) const
 	if (eyeIdx < 0 || eyeIdx > 1) return nullptr;
 	// Synchronous mode: return the buffer we just wrote to (DX12 already completed)
 	return m_eye[eyeIdx].outputDX11[m_outputWrite[eyeIdx]];
+}
+
+ID3D11Texture2D* Fsr3Upscaler::GetWarpOutputDX11(int eyeIdx) const
+{
+	if (eyeIdx < 0 || eyeIdx > 1) return nullptr;
+	return m_eye[eyeIdx].warpOutputDX11;
 }
 
 #endif // defined(SUPPORT_DX) && defined(SUPPORT_DX11) && defined(OC_HAS_FSR3)

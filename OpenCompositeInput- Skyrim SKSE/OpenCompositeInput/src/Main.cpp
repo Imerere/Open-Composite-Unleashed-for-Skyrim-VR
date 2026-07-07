@@ -29,8 +29,19 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 // VTable REL::VariantID(304459, 254680, 0x18fd880)
 // firstPerson bool at offset 0x128
 // FinishAccumulating at vtable slot 0x26
+#include <RE/A/ActorEquipManager.h> // gesture spell equip
+#include <RE/B/BGSEquipSlot.h>      // gesture spell equip (hand slots)
+#include <RE/I/InterfaceStrings.h>  // console show/hide via UI queue
+#include <RE/M/MagicCaster.h>       // gesture instant spell cast
+#include <RE/M/MagicSystem.h>
+#include <RE/S/SpellItem.h>
+#include <RE/T/TESDataHandler.h>    // spell list dump + form resolution
 #include <RE/U/UI.h>
+#include <RE/U/UIMessageQueue.h>    // console show/hide via UI queue
 #include <SKSE/SKSE.h>
+#include <chrono> // gesture concentration-spell burst pacing
+#include <fstream>
+#include <thread> // gesture concentration-spell burst
 
 #include <spdlog/sinks/basic_file_sink.h>
 #include <set>
@@ -176,7 +187,8 @@ struct OCRenderTargetBridge {
 	// ASW uses this to skip MV corrections (reprojection-only) during menus,
 	// preventing UI element duplication on warp frames.
 	uint8_t  isMenuOpen;               // 1 = a gameplay menu is open, 0 = gameplay
-	uint8_t  _padMenu[7];              // alignment
+	uint8_t  isConsoleOpen;            // 1 = the game console menu is open (VR keyboard overlay sync)
+	uint8_t  _padMenu[6];              // alignment
 };
 #pragma pack(pop)
 
@@ -697,9 +709,14 @@ namespace
 				UpdateMenuTransform();
 			}
 
-			// Track console open/close for WM_CHAR suppression
-			if (name == "Console")
+			// Track console open/close for WM_CHAR suppression, and publish it
+			// to the bridge so the VR keyboard's console overlay follows the
+			// REAL console state instead of guessing from its own tilde toggle.
+			if (name == "Console") {
 				g_consoleOpen = a_event->opening;
+				if (g_pBridge)
+					g_pBridge->isConsoleOpen = a_event->opening ? 1 : 0;
+			}
 
 			// Track main menu state for FSR3 (disable temporal upscaling on main menu)
 			if (name == "Main Menu" && g_pBridge) {
@@ -810,15 +827,28 @@ namespace
 	// WndProc hook — keyboard input forwarding + keyboard bridge messages
 	// =========================================================================
 
+	// Cast request passed by pointer from the OCU compositor DLL (same process).
+	// Layout must match the struct in BaseOverlay.cpp's gestures namespace.
+	struct OCGestureCastRequest
+	{
+		char plugin[128];   // source plugin file name (load-order independent)
+		uint32_t formId;    // LOCAL form id within that plugin
+		int mode;           // 0 = cast instantly, 1 = equip left hand, 2 = equip right hand, 3 = start held stream, 4 = stop held stream
+		int hand;           // casting hand: 0 = left, 1 = right (the hand that drew the gesture)
+	};
+
 	LRESULT CALLBACK HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wParam, LPARAM a_lParam)
 	{
-		// Suppress WM_CHAR ONLY when the console is open and VR keyboard is active.
-		// The console gets double entry because scancodes produce WM_CHAR via
-		// TranslateMessage AND PostCharToGame sends GFxCharEvent. Other menus
-		// (SkyUI, MCM, etc.) need WM_CHAR to function, so only block for console.
-		if (a_msg == WM_CHAR && g_consoleOpen) {
+		// Suppress ALL WM_CHAR while the VR keyboard is active. Every character
+		// the VR keyboard types already reaches Scaleform via PostCharToGame's
+		// GFxCharEvent (and Prisma via PrismaVR_DeliverChar), so any WM_CHAR
+		// produced from our injected scancodes by TranslateMessage (or by IME/
+		// message-loop fixer mods like Dekana's) is a duplicate. This was
+		// previously gated on g_consoleOpen, which left PC-mode typing into
+		// SkyUI/MCM/Prisma fields double-entering on setups where WM_CHAR flows.
+		if (a_msg == WM_CHAR) {
 			if ((intptr_t)GetPropW(a_hwnd, L"OC_KB_ACTIVE") != 0) {
-				SKSE::log::trace("WM_CHAR suppressed (console + VR keyboard active): '{}'", (char)a_wParam);
+				SKSE::log::trace("WM_CHAR suppressed (VR keyboard active): '{}'", (char)a_wParam);
 				return 0;
 			}
 		}
@@ -828,6 +858,150 @@ namespace
 		// --- Open Composite keyboard completion signal ---
 		// (Fix 2.1: Thread-safe callback handling)
 		case WM_OC_KEYBOARD: {
+			// wParam 2/3: VR keyboard asks us to SHOW/HIDE the game console
+			// directly through the UI queue. Replaces injected tilde keystrokes,
+			// which double-toggled on some setups (DirectInput + message-loop
+			// mods both acting on the same keystroke). Show/hide is idempotent,
+			// so even a duplicated request cannot invert the console state.
+			// wParam 6: gesture-fired spell cast/equip. lParam = pointer to an
+			// OCGestureCastRequest in the OCU DLL (same process, so the pointer
+			// is valid). Copy the fields here, then act on the main thread.
+			if (a_wParam == 6 && a_lParam) {
+				const auto* req = reinterpret_cast<const OCGestureCastRequest*>(a_lParam);
+				std::string plugin(req->plugin, strnlen(req->plugin, sizeof(req->plugin)));
+				const uint32_t formId = req->formId;
+				const int mode = req->mode;
+				const int hand = req->hand;
+				SKSE::GetTaskInterface()->AddTask([plugin, formId, mode, hand]() {
+					auto* dataHandler = RE::TESDataHandler::GetSingleton();
+					auto* player = RE::PlayerCharacter::GetSingleton();
+					if (!dataHandler || !player)
+						return;
+					auto* spell = dataHandler->LookupForm<RE::SpellItem>(formId, plugin);
+					if (!spell) {
+						SKSE::log::warn("Gesture cast: spell 0x{:X} in '{}' not found", formId, plugin);
+						return;
+					}
+					// Gesture casts come out of the hand that drew the gesture —
+					// each hand's built-in caster works with nothing equipped.
+					// Discovery from live testing: CastSpellImmediate on a
+					// concentration spell doesn't apply one tick, it STARTS a
+					// persistent stream the engine keeps flowing (and keeps
+					// draining magicka for) until someone stops the caster.
+					// So streams are started once and explicitly stopped.
+					const auto castSource = hand == 0
+					    ? RE::MagicSystem::CastingSource::kLeftHand
+					    : RE::MagicSystem::CastingSource::kRightHand;
+					auto* handCaster = player->GetMagicCaster(castSource);
+					if (!handCaster)
+						handCaster = player->GetMagicCaster(RE::MagicSystem::CastingSource::kInstant);
+
+					if (mode == 4) {
+						// Stop a held stream (hold button released)
+						if (handCaster)
+							handCaster->InterruptCast(false);
+						SKSE::log::info("Gesture cast: '{}' stream stopped ({} hand)", spell->GetName(), hand == 0 ? "left" : "right");
+						return;
+					}
+					if (mode == 3) {
+						// Start a held stream: fires once; the engine channels
+						// and drains magicka until our mode-4 stop arrives.
+						auto* avOwner = player->AsActorValueOwner();
+						float cost = spell->CalculateMagickaCost(player);
+						if (avOwner && cost > 0.0f && avOwner->GetActorValue(RE::ActorValue::kMagicka) < cost * 0.5f) {
+							SKSE::log::info("Gesture cast: '{}' fizzled — not enough magicka to start the stream", spell->GetName());
+							return;
+						}
+						if (handCaster) {
+							handCaster->CastSpellImmediate(spell, false, nullptr, 1.0f, false, 0.0f, player);
+							SKSE::log::info("Gesture cast: '{}' streaming from {} hand until release", spell->GetName(), hand == 0 ? "left" : "right");
+						}
+						return;
+					}
+					if (mode == 0) {
+						// Honest magic: instant casts check and drain magicka
+						// like a real cast (powers cost 0 and pass through).
+						auto* avOwner = player->AsActorValueOwner();
+						float cost = spell->CalculateMagickaCost(player);
+						const bool concentration = spell->data.castingType == RE::MagicSystem::CastingType::kConcentration;
+						if (avOwner && cost > 0.0f && avOwner->GetActorValue(RE::ActorValue::kMagicka) < cost) {
+							SKSE::log::info("Gesture cast: '{}' fizzled — not enough magicka ({:.0f} needed)",
+								spell->GetName(), cost);
+							return;
+						}
+						// Concentration streams drain per-second on their own;
+						// only fire-and-forget casts pay a one-shot cost here.
+						if (!concentration && avOwner && cost > 0.0f)
+							avOwner->RestoreActorValue(RE::ActorValue::kMagicka, -cost);
+						if (handCaster) {
+							handCaster->CastSpellImmediate(spell, false, nullptr, 1.0f, false, 0.0f, player);
+							if (concentration) {
+								// Quick-release burst: let the stream run 2s,
+								// then stop the caster (nothing else ever will).
+								SKSE::log::info("Gesture cast: '{}' streaming a 2s burst from {} hand", spell->GetName(), hand == 0 ? "left" : "right");
+								std::thread([hand]() {
+									std::this_thread::sleep_for(std::chrono::seconds(2));
+									SKSE::GetTaskInterface()->AddTask([hand]() {
+										auto* pl = RE::PlayerCharacter::GetSingleton();
+										if (!pl)
+											return;
+										auto src = hand == 0
+										    ? RE::MagicSystem::CastingSource::kLeftHand
+										    : RE::MagicSystem::CastingSource::kRightHand;
+										if (auto* cst = pl->GetMagicCaster(src))
+											cst->InterruptCast(false);
+									});
+								}).detach();
+							} else {
+								SKSE::log::info("Gesture cast: '{}' fired from {} hand ({:.0f} magicka)", spell->GetName(), hand == 0 ? "left" : "right", cost);
+							}
+						}
+					} else {
+						// CK equip slots: right hand 0x13F42, left hand 0x13F43.
+						// Plain lookup + static_cast: these engine FormIDs are
+						// guaranteed BGSEquipSlot, and As<> has template-linkage
+						// issues in this CommonLib build.
+						auto* slot = static_cast<RE::BGSEquipSlot*>(
+							RE::TESForm::LookupByID(mode == 1 ? 0x00013F43 : 0x00013F42));
+						RE::ActorEquipManager::GetSingleton()->EquipSpell(player, spell, slot);
+						SKSE::log::info("Gesture cast: '{}' equipped to {} hand", spell->GetName(), mode == 1 ? "left" : "right");
+					}
+				});
+				return 0;
+			}
+
+			// wParam 4/5: gesture-fired key DOWN/UP (lParam = DIK scancode).
+			// Injected into Skyrim's own input event queue on the main thread,
+			// so SKSE hotkey listeners (Prisma, MCM, AIAgent) receive a real
+			// ButtonEvent regardless of window focus or SendInput filtering.
+			if (a_wParam == 4 || a_wParam == 5) {
+				const int scancode = static_cast<int>(a_lParam);
+				const bool down = (a_wParam == 4);
+				SKSE::GetTaskInterface()->AddTask([scancode, down]() {
+					auto* queue = RE::BSInputEventQueue::GetSingleton();
+					if (queue)
+						queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, 0, scancode,
+							down ? 1.0f : 0.0f, down ? 0.0f : 0.06f);
+				});
+				SKSE::log::info("Gesture key {} scancode 0x{:X} queued into game input", down ? "DOWN" : "UP", scancode);
+				return 0;
+			}
+
+			if (a_wParam == 2 || a_wParam == 3) {
+				const bool show = (a_wParam == 2);
+				SKSE::GetTaskInterface()->AddUITask([show]() {
+					auto* queue = RE::UIMessageQueue::GetSingleton();
+					auto* strings = RE::InterfaceStrings::GetSingleton();
+					if (queue && strings) {
+						queue->AddMessage(strings->console,
+							show ? RE::UI_MESSAGE_TYPE::kShow : RE::UI_MESSAGE_TYPE::kHide,
+							nullptr);
+					}
+				});
+				SKSE::log::info("Console {} requested by VR keyboard", show ? "SHOW" : "HIDE");
+				return 0;
+			}
+
 			// Copy callback state under lock, then invoke outside lock to avoid deadlock
 			DoneCallback_t* doneCb = nullptr;
 			CancelCallback_t* cancelCb = nullptr;
@@ -2606,6 +2780,93 @@ uint main() : SV_Target { return 255; }
 	// SKSE message handler
 	// =========================================================================
 
+	// =========================================================================
+	// Gesture spell support
+	// =========================================================================
+
+	// Dump every castable spell and power in the load order so the Configurator
+	// can offer a searchable picker. Written to the SKSE folder in My Games
+	// (survives Root Builder cleanup; refreshed every game launch).
+	void DumpGestureSpellList()
+	{
+		auto* dataHandler = RE::TESDataHandler::GetSingleton();
+		if (!dataHandler)
+			return;
+		auto dir = SKSE::log::log_directory();
+		if (!dir)
+			return;
+
+		// Spells the player character actually knows (race/base + learned).
+		// Empty at kDataLoaded (no save yet); filled on the post-load re-dump.
+		std::set<RE::FormID> known;
+		if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+			if (auto* base = player->GetActorBase()) {
+				if (auto* effects = base->actorEffects) {
+					for (uint32_t i = 0; i < effects->numSpells; i++)
+						if (effects->spells[i])
+							known.insert(effects->spells[i]->GetFormID());
+				}
+			}
+			for (auto* sp : player->GetActorRuntimeData().addedSpells)
+				if (sp)
+					known.insert(sp->GetFormID());
+		}
+
+		auto path = *dir / "OCUGestureSpellList.json";
+		std::ofstream out(path);
+		if (!out.is_open()) {
+			SKSE::log::warn("Gesture spell list: cannot write {}", path.string());
+			return;
+		}
+
+		auto esc = [](std::string_view s) {
+			std::string r;
+			for (char c : s) {
+				if (c == '"' || c == '\\')
+					r += '\\';
+				if ((unsigned char)c >= 0x20)
+					r += c;
+			}
+			return r;
+		};
+
+		out << "[\n";
+		bool first = true;
+		int count = 0;
+		for (auto* spell : dataHandler->GetFormArray<RE::SpellItem>()) {
+			if (!spell)
+				continue;
+			auto type = spell->GetSpellType();
+			if (type != RE::MagicSystem::SpellType::kSpell
+				&& type != RE::MagicSystem::SpellType::kPower
+				&& type != RE::MagicSystem::SpellType::kLesserPower)
+				continue;
+			const char* name = spell->GetName();
+			if (!name || !name[0])
+				continue;
+			auto* file = spell->GetFile(0);
+			if (!file)
+				continue;
+
+			if (!first)
+				out << ",\n";
+			first = false;
+			const char* kind = (type == RE::MagicSystem::SpellType::kSpell) ? "spell" : "power";
+			char formHex[16];
+			snprintf(formHex, sizeof(formHex), "0x%X", spell->GetLocalFormID());
+			const bool conc = spell->data.castingType == RE::MagicSystem::CastingType::kConcentration;
+			out << "  {\"name\":\"" << esc(name)
+				<< "\",\"plugin\":\"" << esc(file->GetFilename())
+				<< "\",\"formId\":\"" << formHex
+				<< "\",\"type\":\"" << kind
+				<< "\",\"casting\":\"" << (conc ? "conc" : "ff")
+				<< "\",\"known\":" << (known.count(spell->GetFormID()) ? "true" : "false") << "}";
+			count++;
+		}
+		out << "\n]\n";
+		SKSE::log::info("Gesture spell list: dumped {} spells/powers to {}", count, path.string());
+	}
+
 	void OnMessage(SKSE::MessagingInterface::Message* a_msg)
 	{
 		switch (a_msg->type) {
@@ -2627,12 +2888,16 @@ uint main() : SV_Target { return 255; }
 				SKSE::log::info("MenuOpenCloseEvent sink registered");
 			}
 
+			// Spell picker source for the Configurator's gesture actions
+			DumpGestureSpellList();
+
 			break;
 
 		case SKSE::MessagingInterface::kPostLoadGame:
 		case SKSE::MessagingInterface::kNewGame:
 			FindAndStoreNiCamera();  // Retry after scene graph is fully loaded
 			TestRendererShadowState();  // Diagnostic: verify game VP matrices
+			DumpGestureSpellList();  // Re-dump with the character's known spells tagged
 			break;
 
 		case SKSE::MessagingInterface::kInputLoaded:

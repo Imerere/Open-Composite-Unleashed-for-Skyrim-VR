@@ -205,13 +205,30 @@ struct OCRenderTargetBridge {
 
 	// Menu state — ASW skips MV corrections when a menu is open.
 	uint8_t  isMenuOpen;               // 1 = a gameplay menu is open, 0 = gameplay
-	uint8_t  _padMenu[7];              // alignment
+	uint8_t  isConsoleOpen;            // 1 = the game console menu is open (VR keyboard overlay sync)
+	uint8_t  _padMenu[6];              // alignment
 };
 #pragma pack(pop)
 
 static HANDLE s_hBridgeMap = nullptr;
 static OCRenderTargetBridge* s_pBridge = nullptr;
 static bool s_bridgeTried = false;
+
+static void OpenRenderTargetBridge();
+
+// Real console state from the SKSE MenuOpenCloseEvent, via the bridge.
+// Used by VRKeyboard to keep its console overlay in lockstep with the game
+// instead of blind-toggling on tilde. Returns -1 when no bridge (non-Skyrim
+// or plugin not connected yet) so the keyboard can fall back to its toggle.
+// Deliberately does NOT require status == 1: that flag gates render-target
+// readiness (motion vectors etc.), which has nothing to do with menu state.
+int OCBridge_ConsoleState()
+{
+	OpenRenderTargetBridge(); // self-throttled; connects even when MV/FSR paths never ran
+	if (!s_pBridge)
+		return -1;
+	return s_pBridge->isConsoleOpen ? 1 : 0;
+}
 static void OpenRenderTargetBridge()
 {
 	if (s_pBridge)
@@ -3305,7 +3322,7 @@ static bool Fsr3WarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p,
 		return false;
 	}
 
-	*outResult = s_fsr3Upscaler->GetOutputDX11(p.eye);
+	*outResult = s_fsr3Upscaler->GetWarpOutputDX11(p.eye);
 	return (*outResult != nullptr);
 }
 #endif

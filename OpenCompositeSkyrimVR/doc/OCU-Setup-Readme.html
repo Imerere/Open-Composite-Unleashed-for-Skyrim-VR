@@ -230,6 +230,41 @@
         <li>Put the Configurator EXE in the OCU mod folder. The Configurator is designed to save to both the mod folder and the game location.</li>
         <li>After saving, verify <code>opencomposite.ini</code> and <code>openvr_api.dll</code> are present beside <code>SkyrimVR.exe</code> at launch.</li>
       </ol>
+      <h3>MO2 Root Folder: With And Without Root Builder</h3>
+      <p>
+        MO2's virtual file system only covers the <code>Data</code> folder, and only for programs launched through MO2.
+        Even current MO2 versions (2.5.x) have no built-in way to put files beside <code>SkyrimVR.exe</code>.
+        The <code>Root</code> folder inside the OCU mod needs one of the two setups below.
+      </p>
+      <p><strong>Option A: Root Builder plugin (recommended).</strong></p>
+      <p>
+        First check if you already have it: open MO2 and look under <strong>Tools &gt; Tool Plugins</strong>.
+        If a <strong>Root Builder</strong> entry is there (with Build / Clear / Sync), the plugin is already
+        installed. Many Wabbajack lists ship with it. If so, skip straight to launching the game.
+      </p>
+      <ol>
+        <li>Download the Root Builder plugin for MO2 (by Kezyma, on Nexus).</li>
+        <li>Extract the <code>rootbuilder</code> folder into your MO2 <code>plugins</code> folder and restart MO2.</li>
+        <li>Root Builder looks for a folder literally named <code>Root</code> inside each mod and deploys its contents beside <code>SkyrimVR.exe</code> when you launch the game through MO2, then cleans up after (with autobuild on). The OCU package already uses this convention.</li>
+      </ol>
+      <p>
+        Root Builder has several modes. This choice matters for OCU:
+      </p>
+      <ul>
+        <li><strong>Copy mode (the default): use this.</strong> Files are physically copied to the game folder at launch. Most compatible.</li>
+        <li><strong>USVFS + Link mode</strong> also works: it virtualizes most files but hard-links <code>.exe</code> and <code>.dll</code> files so they physically exist at launch.</li>
+        <li><strong>Pure USVFS mode: do NOT use for OCU.</strong> Fully virtual root sounds ideal, but it struggles with files required at process launch. <code>openvr_api.dll</code> and the FidelityFX / DLSS DLLs load when SkyrimVR starts, which is exactly the case that breaks. Symptom: the game launches through SteamVR as if OCU is not installed.</li>
+      </ul>
+      <p><strong>Option B: Manual copy (no Root Builder).</strong></p>
+      <ol>
+        <li>Open the OCU mod folder in MO2 (right click the mod, Open in Explorer).</li>
+        <li>Copy everything inside the <code>Root</code> folder (<code>openvr_api.dll</code>, <code>opencomposite.ini</code>, the FidelityFX and DLSS DLLs) directly into the folder that contains <code>SkyrimVR.exe</code>.</li>
+        <li>Repeat the copy after every OCU update. Manual copies do not update themselves.</li>
+      </ol>
+      <div class="warn">
+        Root Builder is not required, but without it the root files must be copied by hand.
+        Either way the test is the same: if Skyrim launches through SteamVR instead of OCU, the root files were not beside <code>SkyrimVR.exe</code> at launch.
+      </div>
       <h3>Vortex</h3>
       <ol>
         <li>Install and deploy the OCU package.</li>
@@ -398,6 +433,40 @@
         <li>Do not run ASW and SSW at the same time.</li>
         <li>If SSW is smoother for your setup, keep using SSW.</li>
         <li>ASW support tickets are not accepted yet unless the user is intentionally testing experimental ASW.</li>
+      </ul>
+
+      <h3>How OCU ASW Works</h3>
+      <p>
+        With ASW on, the game renders at a throttled rate (for example 45 fps) and OCU generates a synthetic frame
+        between each real frame by re-projecting the last real frame with depth-based parallax. Rotation smoothing is
+        left to the runtime's own reprojection; OCU's warp corrects position, locomotion, and depth parallax.
+      </p>
+
+      <h3>ASW Advanced Settings Reference</h3>
+      <p>All of these live in <code>opencomposite.ini</code> and most are exposed in the Configurator's ASW panel.</p>
+      <ul>
+        <li><code>aswWarpStrength</code>: master strength. 0 shows the cached frame with no correction, 1 is full correction. Default 1.0.</li>
+        <li><code>aswTranslationScale</code>: how strongly head position changes (leaning, stepping) are corrected on synthetic frames. Default 1.0.</li>
+        <li><code>aswRotationScale</code>: stick-turn correction. Default 0 (off) because the runtime already handles rotation. If turning judders, try 0.5. If it doubles, the sign is backwards for your setup.</li>
+        <li><code>aswLocoScale</code>: stick locomotion correction so the world does not rubber-band while you run. Default 1.0.</li>
+        <li><code>aswDepthScale</code>: parallax intensity from the depth buffer. Lower it if near geometry wobbles. Default 1.0.</li>
+        <li><code>aswEdgeFadeWidth</code>: fades warp at depth edges to hide stretching artifacts. Higher = wider fade. Default 3.0.</li>
+        <li><code>aswNearFadeDepth</code>: parallax fades out closer than this distance in meters. Useful if your hands or weapon smear. 0 = off.</li>
+        <li><code>aswAutoNative</code> + <code>aswAutoEngageFps</code>: opt-in auto mode. ASW stays out of the way while your natural fps is above the threshold and engages only when fps falls below it.</li>
+        <li><code>aswDebugMode</code>: 10 tints synthetic frames so you can see the real:synthetic cadence. 0 = off.</li>
+        <li><code>aswUpscalerReset</code>: when DLSS/FSR upscaling runs on warp frames, resets temporal history each synthetic frame (spatial-only upscaling on warps). Reduces foliage trail artifacts at some sharpness cost.</li>
+      </ul>
+
+      <h3>Buffered Scheduling And The Debug Tint</h3>
+      <p>
+        Buffered scheduling (<code>aswBufferEnabled</code>) is an experimental split-frame scheduling mode. It changes
+        when the warp is produced relative to the compositor deadline.
+      </p>
+      <ul>
+        <li>In the default inline mode, debug mode 10 tints every synthetic frame, so at a 45 fps throttle on a 90 Hz headset you should see a 1:1 flicker of tinted and clean frames.</li>
+        <li>In buffered mode the tint overlay is currently not reliable. Losing the tint usually means synthetic frames are being dropped rather than hidden, so treat missing tint in buffered mode as a warning sign, not a display bug.</li>
+        <li>If you are unsure whether ASW is engaging through a wireless runtime (Steam Link, Virtual Desktop), set the fps throttle to half refresh, enable debug mode 10, and look for the alternating tint in the default inline mode first.</li>
+        <li>Buffered mode and <code>aswConcurrentFrameThread</code> are for testing only. If you just want smooth play, leave both off.</li>
       </ul>
     </section>
 

@@ -12,7 +12,7 @@ using System.Windows.Forms;
 
 namespace OpenCompositeConfigurator
 {
-    public class MainForm : Form
+    public partial class MainForm : Form
     {
         // INI data
         private readonly IniFile _ini = new();
@@ -208,6 +208,12 @@ namespace OpenCompositeConfigurator
         // Bottom buttons
         private Button _btnSave = null!;
         private Button _btnReload = null!;
+
+        // Unsaved-changes indicator: breathing overlay banner + on-close save prompt
+        private Label _lblUnsavedBanner = null!;
+        private System.Windows.Forms.Timer _breatheTimer = null!;
+        private bool _flashOn = false;
+        private bool _dirty = false;
 
         // Status
         private Label _lblStatus = null!;
@@ -416,6 +422,7 @@ namespace OpenCompositeConfigurator
             SetDefaults();
             LoadDefaultKeyBindings();
             ApplyCurrentGamePaths();
+            WireDirtyTracking(this);   // subscribe AFTER initial population so loading never marks dirty
         }
 
         private void LoadControllerImage()
@@ -424,6 +431,7 @@ namespace OpenCompositeConfigurator
             using var stream = assembly.GetManifestResourceStream("OpenCompositeConfigurator.Resources.controllers.png");
             if (stream != null)
                 _controllerImage = Image.FromStream(stream);
+            LoadKnucklesImage();
         }
 
         private void LoadKofiImage()
@@ -503,6 +511,25 @@ namespace OpenCompositeConfigurator
             };
             Controls.Add(_lblInstallNotice);
 
+            // Floating overlay on the top notice line (Visible=false until dirty) — big bold letters breathe, no box, no reflow
+            _lblUnsavedBanner = new Label
+            {
+                Location = new Point(leftMargin + 225, y - 5),
+                Width = 860,
+                Height = 34,
+                Visible = false,
+                BackColor = Color.FromArgb(30, 30, 35),
+                ForeColor = Color.FromArgb(120, 75, 20),
+                Font = new Font("Segoe UI", 20f, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleCenter,
+                Text = "YOU HAVE UNSAVED CHANGES, REMEMBER TO SAVE."
+            };
+            Controls.Add(_lblUnsavedBanner);
+            _lblUnsavedBanner.BringToFront();
+
+            _breatheTimer = new System.Windows.Forms.Timer { Interval = 450 };
+            _breatheTimer.Tick += BreatheTimer_Tick;
+
             y += 40;
 
             // ══════════════════════════════════════════════════════════════════
@@ -541,10 +568,26 @@ namespace OpenCompositeConfigurator
             _btnTabKeyboard.Click += (s, e) => SwitchTab(1);
             Controls.Add(_btnTabKeyboard);
 
+            _btnTabGestures = new Button
+            {
+                Text = "Gestures",
+                Location = new Point(leftMargin + 230, y),
+                Size = new Size(95, 30),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10f),
+                ForeColor = Color.FromArgb(160, 160, 160),
+                BackColor = Color.FromArgb(35, 35, 40),
+                Cursor = Cursors.Hand,
+            };
+            _btnTabGestures.FlatAppearance.BorderSize = 0;
+            _btnTabGestures.FlatAppearance.MouseOverBackColor = Color.FromArgb(50, 50, 55);
+            _btnTabGestures.Click += (s, e) => SwitchTab(2);
+            Controls.Add(_btnTabGestures);
+
             _btnTabVideo = new Button
             {
                 Text = "Video",
-                Location = new Point(leftMargin + 230, y),
+                Location = new Point(leftMargin + 330, y),
                 Size = new Size(90, 30),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 10f),
@@ -554,7 +597,7 @@ namespace OpenCompositeConfigurator
             };
             _btnTabVideo.FlatAppearance.BorderSize = 0;
             _btnTabVideo.FlatAppearance.MouseOverBackColor = Color.FromArgb(50, 50, 55);
-            _btnTabVideo.Click += (s, e) => SwitchTab(2);
+            _btnTabVideo.Click += (s, e) => SwitchTab(3);
             Controls.Add(_btnTabVideo);
 
             y += 32;
@@ -581,7 +624,18 @@ namespace OpenCompositeConfigurator
             };
             Controls.Add(_tabKeyboard);
 
-            // Panel 3: Video Settings
+            // Panel 3: Gestures
+            _tabGestures = new Panel
+            {
+                Location = new Point(leftMargin, y),
+                Size = new Size(rightEdge - leftMargin, 800), // resized after content built
+                BackColor = Color.FromArgb(30, 30, 35),
+                AutoScroll = false,
+                Visible = false,
+            };
+            Controls.Add(_tabGestures);
+
+            // Panel 4: Video Settings
             _tabVideo = new Panel
             {
                 Location = new Point(leftMargin, y),
@@ -595,12 +649,14 @@ namespace OpenCompositeConfigurator
             // Build content for each tab (each auto-sizes its panel)
             BuildSettingsTab();
             BuildKeyboardTab();
+            BuildGesturesTab();
             BuildVideoTab();
 
             // Sync all tabs to the same height (tallest content)
-            int tallestTab = Math.Max(Math.Max(_tabSettings.Height, _tabKeyboard.Height), _tabVideo.Height);
+            int tallestTab = Math.Max(Math.Max(Math.Max(_tabSettings.Height, _tabKeyboard.Height), _tabGestures.Height), _tabVideo.Height);
             _tabSettings.Size = new Size(_tabSettings.Width, tallestTab);
             _tabKeyboard.Size = new Size(_tabKeyboard.Width, tallestTab);
+            _tabGestures.Size = new Size(_tabGestures.Width, tallestTab);
             _tabVideo.Size = new Size(_tabVideo.Width, tallestTab);
 
             // Support footer right after the tabs
@@ -800,6 +856,36 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(lblLeftTrigger);
             container.Controls.Add(lblRightTrigger);
 
+            // Index trackpad swipe row: only visible when the knuckles model is
+            // selected on the Bindings tab (ApplyControllerModel toggles it)
+            chkY += 22;
+            _lblTrackpadSwipe = MakeLabel("Trackpad:", cx, chkY + 3, 70);
+            _lblTrackpadSwipe.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            _lblTrackpadSwipe.ForeColor = Color.FromArgb(180, 200, 255);
+            _lblTrackpadSwipe.Visible = false;
+            container.Controls.Add(_lblTrackpadSwipe);
+
+            _cmbTrackpadSwipe = new ComboBox
+            {
+                Location = new Point(cx + 74, chkY),
+                Width = 130,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 55),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8.5f),
+                Visible = false,
+            };
+            _cmbTrackpadSwipe.Items.AddRange(new object[] { "None", "Swipe Up", "Swipe Down" });
+            _cmbTrackpadSwipe.SelectedIndex = 0;
+            container.Controls.Add(_cmbTrackpadSwipe);
+
+            _lblTrackpadSwipeHint = MakeLabel("Swipe the Index trackpad to open the keyboard", cx + 210, chkY + 3, 300);
+            _lblTrackpadSwipeHint.ForeColor = Color.FromArgb(140, 140, 140);
+            _lblTrackpadSwipeHint.Font = new Font(Font.FontFamily, 8.5f, FontStyle.Italic);
+            _lblTrackpadSwipeHint.Visible = false;
+            container.Controls.Add(_lblTrackpadSwipeHint);
+
             foreach (var chk in new[] { _chkLeftStick, _chkLeftX, _chkLeftY,
                                         _chkRightStick, _chkRightA, _chkRightB })
             {
@@ -920,26 +1006,9 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(MakeLabel("%", rx + 398, ry + 3, 20));
             ry += 36;
 
-            // Row 5: Sticky-position reset. The keyboard remembers where the user parks it
-            // (head-relative offset written by the DLL on grab release); this restores the
-            // factory spawn offset without touching any other keyboard settings.
-            var btnKbPosReset = MakeButton("Reset Keyboard Position", rx, ry, 250, 28);
-            btnKbPosReset.Click += (s, e) =>
-            {
-                _ini.Set("keyboard", "positionForward", "0.80");
-                _ini.Set("keyboard", "positionDown", "0.52");
-                _ini.Set("keyboard", "positionRight", "0.00");
-                _ini.Save();
-                MessageBox.Show("Keyboard position reset to default (80cm forward, 52cm below eyes).",
-                    "OCU Configurator", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            };
-            container.Controls.Add(btnKbPosReset);
-            ry += 32;
-            var lblKbPosDesc = MakeLabel("The keyboard remembers where you park it. This restores the default spot.", rx, ry, 440);
-            lblKbPosDesc.ForeColor = Color.FromArgb(130, 130, 130);
-            lblKbPosDesc.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
-            container.Controls.Add(lblKbPosDesc);
-            ry += 24;
+            // No reset-position control: the keyboard spawns head-relative and clamped to
+            // arm's reach, so it can never be lost — moving it is the reset. The DLL still
+            // persists the parked offset (positionForward/Down/Right) for sticky placement.
 
             y = Math.Max(Math.Max(imageBottom, chkY), ry);
 
@@ -1898,7 +1967,12 @@ namespace OpenCompositeConfigurator
             _picBindingsController.Paint += PicBindingsController_Paint;
             _picBindingsController.MouseMove += PicBindingsController_MouseMove;
             _picBindingsController.MouseClick += PicBindingsController_MouseClick;
+            _picBindingsController.MouseDown += PicBindingsController_MouseDown;
+            _picBindingsController.MouseUp += PicBindingsController_MouseUp;
             container.Controls.Add(_picBindingsController);
+
+            // Active dot layout starts as the Touch defaults (plus any saved calibration)
+            ApplyControllerModel("touch");
 
             // Vertical separator between combos and controller
             var sepPanel = new Panel
@@ -1936,8 +2010,11 @@ namespace OpenCompositeConfigurator
             };
             container.Controls.Add(_comboListPanel);
 
+            // Controller model switcher + dot calibration, under the photo
+            BuildControllerSwitcherRow(container, splitX + 10, sideY + imgHeight + 4, imgWidth);
+
             // Status label below both columns
-            y = sideY + imgHeight + 6;
+            y = sideY + imgHeight + 34;
 
             _lblKbStatus = MakeLabel("", leftMargin, y, 800);
             _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
@@ -2089,7 +2166,8 @@ namespace OpenCompositeConfigurator
         {
             float imgW = _picBindingsController.Width;
             float imgH = _picBindingsController.Height;
-            float imgAspect = _controllerImage != null ? (float)_controllerImage.Width / _controllerImage.Height : 1.6f;
+            var img = ActiveControllerImage;
+            float imgAspect = img != null ? (float)img.Width / img.Height : 1.6f;
             float boxAspect = imgW / imgH;
             if (boxAspect > imgAspect)
                 return (imgH * imgAspect, imgH, (imgW - imgH * imgAspect) / 2, 0);
@@ -2101,12 +2179,12 @@ namespace OpenCompositeConfigurator
         {
             string? closest = null;
             float closestDist = float.MaxValue;
-            foreach (var kvp in ControllerButtons)
+            foreach (var kvp in _activeControllerButtons)
             {
                 if (!IsControllerButtonVisible(kvp.Key))
                     continue;
 
-                float hitRadius = kvp.Value.isStickDir ? 0.025f : 0.04f;
+                float hitRadius = HitRadiusFor(kvp.Key, kvp.Value.isStickDir);
                 float dx = fx - kvp.Value.pos.X;
                 float dy = fy - kvp.Value.pos.Y;
                 float dist = (float)Math.Sqrt(dx * dx + dy * dy);
@@ -2136,6 +2214,7 @@ namespace OpenCompositeConfigurator
 
         private void PicBindingsController_MouseMove(object? sender, MouseEventArgs e)
         {
+            if (HandleDotDragMove(e)) return;
             var (drawW, drawH, offX, offY) = GetBindingsImageBounds();
             float fx = (e.X - offX) / drawW;
             float fy = (e.Y - offY) / drawH;
@@ -2154,8 +2233,11 @@ namespace OpenCompositeConfigurator
             float fx = (e.X - offX) / drawW;
             float fy = (e.Y - offY) / drawH;
 
+            if (_chkMoveDots != null && _chkMoveDots.Checked)
+                return; // calibration mode: clicks are for dragging dots, not binding
+
             string? hit = HitTestControllerButton(fx, fy);
-            if (hit != null && ControllerButtons.TryGetValue(hit, out var info))
+            if (hit != null && _activeControllerButtons.TryGetValue(hit, out var info))
             {
                 _selectedCtrlButton = hit;
                 RefreshSelectedControllerBinding(updateStatus: true);
@@ -2237,9 +2319,24 @@ namespace OpenCompositeConfigurator
         private void RefreshSelectedControllerBinding(bool updateStatus)
         {
             if (_selectedCtrlButton == null) return;
-            if (!ControllerButtons.TryGetValue(_selectedCtrlButton, out var info)) return;
+            if (!_activeControllerButtons.TryGetValue(_selectedCtrlButton, out var info)) return;
 
             _lblCtrlButton.Text = info.display;
+
+            if (IsTrackpadButton(_selectedCtrlButton))
+            {
+                // Index trackpad: behavior is fixed by OCU's input translation,
+                // not by controlmap hex, so show what it does instead of a combo.
+                _cmbCtrlAction.Enabled = false;
+                SelectActionInCombo(_cmbCtrlAction, null);
+                if (updateStatus)
+                {
+                    _lblKbStatus.Text = $"{info.display}: click = A Button (lower half) or B/Menu (upper half). With VRIK Knuckles support enabled it feeds VRIK gestures instead. Not separately remappable.";
+                    _lblKbStatus.ForeColor = Color.FromArgb(255, 200, 100);
+                }
+                _picBindingsController.Invalidate();
+                return;
+            }
 
             if (info.isStickDir)
             {
@@ -2303,20 +2400,40 @@ namespace OpenCompositeConfigurator
             bool hasRight = !string.IsNullOrEmpty(hex.hexRight);
             bool hasLeft = !string.IsNullOrEmpty(hex.hexLeft);
 
+            // Write every VR device column pair so bindings apply no matter what
+            // controller type the runtime reports. Skyrim reads: Vive 4/5,
+            // Oculus 6/7, WMR 8/9 (0-indexed). Index knuckles report "knuckles"
+            // and fall into the Vive columns, which is why Oculus-only writes
+            // silently did nothing for Index and Vive users.
+            int[] rightVrFields = { 4, 6, 8 };
+            int[] leftVrFields = { 5, 7, 9 };
+
             // Clear old action that had this button's hex code
             foreach (var fields in actions)
             {
-                if (fields.Length <= 7) continue;
+                if (fields.Length <= 9) continue;
                 string actionName = fields[0];
-                if (hasRight && TryRemoveControllerHex(fields[6], hex.hexRight, out var rightValue))
+                if (hasRight)
                 {
-                    fields[6] = rightValue;
-                    RecordControllerChange(ctx, actionName, 6, rightValue);
+                    foreach (int f in rightVrFields)
+                    {
+                        if (TryRemoveControllerHex(fields[f], hex.hexRight, out var rightValue))
+                        {
+                            fields[f] = rightValue;
+                            RecordControllerChange(ctx, actionName, f, rightValue);
+                        }
+                    }
                 }
-                if (hasLeft && TryRemoveControllerHex(fields[7], hex.hexLeft, out var leftValue))
+                if (hasLeft)
                 {
-                    fields[7] = leftValue;
-                    RecordControllerChange(ctx, actionName, 7, leftValue);
+                    foreach (int f in leftVrFields)
+                    {
+                        if (TryRemoveControllerHex(fields[f], hex.hexLeft, out var leftValue))
+                        {
+                            fields[f] = leftValue;
+                            RecordControllerChange(ctx, actionName, f, leftValue);
+                        }
+                    }
                 }
             }
 
@@ -2325,23 +2442,29 @@ namespace OpenCompositeConfigurator
             {
                 foreach (var fields in actions)
                 {
-                    if (fields.Length <= 7) continue;
+                    if (fields.Length <= 9) continue;
                     if (fields[0] != newAction) continue;
                     if (hasRight)
                     {
-                        fields[6] = hex.hexRight;
-                        RecordControllerChange(ctx, newAction, 6, hex.hexRight);
+                        foreach (int f in rightVrFields)
+                        {
+                            fields[f] = hex.hexRight;
+                            RecordControllerChange(ctx, newAction, f, hex.hexRight);
+                        }
                     }
                     if (hasLeft)
                     {
-                        fields[7] = hex.hexLeft;
-                        RecordControllerChange(ctx, newAction, 7, hex.hexLeft);
+                        foreach (int f in leftVrFields)
+                        {
+                            fields[f] = hex.hexLeft;
+                            RecordControllerChange(ctx, newAction, f, hex.hexLeft);
+                        }
                     }
                     break;
                 }
             }
 
-            var btnInfo = ControllerButtons[_selectedCtrlButton];
+            var btnInfo = _activeControllerButtons[_selectedCtrlButton];
             _lblKbStatus.Text = isNone
                 ? $"{btnInfo.display}: Unbound (unsaved)"
                 : $"{btnInfo.display} → {newAction} (unsaved)";
@@ -2387,7 +2510,7 @@ namespace OpenCompositeConfigurator
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var (drawW, drawH, offX, offY) = GetBindingsImageBounds();
 
-            foreach (var kvp in ControllerButtons)
+            foreach (var kvp in _activeControllerButtons)
             {
                 if (!IsControllerButtonVisible(kvp.Key))
                     continue;
@@ -2429,8 +2552,9 @@ namespace OpenCompositeConfigurator
                 }
                 else
                 {
-                    // Regular buttons: circles
-                    float r = 14f;
+                    // Regular buttons: circles (knuckles face dots are half
+                    // size; grips and triggers stay full size on all models)
+                    float r = DotRadiusFor(kvp.Key);
 
                     using (var ghostPen = new Pen(Color.FromArgb(50, 255, 255, 255), 1.5f))
                     using (var ghostBrush = new SolidBrush(Color.FromArgb(25, 255, 255, 255)))
@@ -2460,7 +2584,7 @@ namespace OpenCompositeConfigurator
                         using var font = new Font("Segoe UI", 7f, FontStyle.Bold);
                         using var textBrush = new SolidBrush(Color.White);
                         var sf = new StringFormat { Alignment = StringAlignment.Center };
-                        g.DrawString(kvp.Value.display, font, textBrush, cx, cy + 14f + 2, sf);
+                        g.DrawString(kvp.Value.display, font, textBrush, cx, cy + r + 2, sf);
                     }
                 }
             }
@@ -4133,7 +4257,8 @@ namespace OpenCompositeConfigurator
         {
             float imgW = _picControllers.Width;
             float imgH = _picControllers.Height;
-            float imgAspect = _controllerImage != null ? (float)_controllerImage.Width / _controllerImage.Height : 1.6f;
+            var img = ActiveControllerImage;
+            float imgAspect = img != null ? (float)img.Width / img.Height : 1.6f;
             float boxAspect = imgW / imgH;
             if (boxAspect > imgAspect)
                 return (imgH * imgAspect, imgH, (imgW - imgH * imgAspect) / 2, 0);
@@ -4147,11 +4272,11 @@ namespace OpenCompositeConfigurator
             float fx = (e.X - offX) / drawW;
             float fy = (e.Y - offY) / drawH;
 
-            float hitRadius = 0.06f;
+            float hitRadius = ShortcutHitRadius;
             string? closest = null;
             float closestDist = float.MaxValue;
 
-            foreach (var kvp in ButtonPositions)
+            foreach (var kvp in ShortcutButtonPositions())
             {
                 foreach (var pt in kvp.Value)
                 {
@@ -4211,11 +4336,12 @@ namespace OpenCompositeConfigurator
             using var brush = new SolidBrush(Color.FromArgb(70, 255, 200, 40));
 
             var selected = GetSelectedButtons();
-            float r = 10;
+            float r = ShortcutDotRadius;
+            var positions = ShortcutButtonPositions();
 
             foreach (string btnId in selected)
             {
-                if (!ButtonPositions.TryGetValue(btnId, out var points))
+                if (!positions.TryGetValue(btnId, out var points))
                     continue;
 
                 foreach (var pt in points)
@@ -4283,6 +4409,7 @@ namespace OpenCompositeConfigurator
                 return;
             }
 
+            SyncComboEditorModel();
             using var dlg = new ComboEditForm(KeyScancodes);
             if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
             {
@@ -4323,6 +4450,7 @@ namespace OpenCompositeConfigurator
         {
             if (index < 0 || index >= _combos.Count) return;
 
+            SyncComboEditorModel();
             using var dlg = new ComboEditForm(KeyScancodes, _combos[index]);
             if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
             {
@@ -5513,7 +5641,8 @@ namespace OpenCompositeConfigurator
         {
             _tabSettings.Visible = (index == 0);
             _tabKeyboard.Visible = (index == 1);
-            _tabVideo.Visible = (index == 2);
+            _tabGestures.Visible = (index == 2);
+            _tabVideo.Visible = (index == 3);
 
             // Update button styles
             _btnTabSettings.Font = new Font("Segoe UI", 10f, index == 0 ? FontStyle.Bold : FontStyle.Regular);
@@ -5524,9 +5653,13 @@ namespace OpenCompositeConfigurator
             _btnTabKeyboard.ForeColor = index == 1 ? Color.White : Color.FromArgb(160, 160, 160);
             _btnTabKeyboard.BackColor = index == 1 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
 
-            _btnTabVideo.Font = new Font("Segoe UI", 10f, index == 2 ? FontStyle.Bold : FontStyle.Regular);
-            _btnTabVideo.ForeColor = index == 2 ? Color.White : Color.FromArgb(160, 160, 160);
-            _btnTabVideo.BackColor = index == 2 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
+            _btnTabGestures.Font = new Font("Segoe UI", 10f, index == 2 ? FontStyle.Bold : FontStyle.Regular);
+            _btnTabGestures.ForeColor = index == 2 ? Color.White : Color.FromArgb(160, 160, 160);
+            _btnTabGestures.BackColor = index == 2 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
+
+            _btnTabVideo.Font = new Font("Segoe UI", 10f, index == 3 ? FontStyle.Bold : FontStyle.Regular);
+            _btnTabVideo.ForeColor = index == 3 ? Color.White : Color.FromArgb(160, 160, 160);
+            _btnTabVideo.BackColor = index == 3 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -5939,6 +6072,7 @@ namespace OpenCompositeConfigurator
                 _lblStatus.ForeColor = Color.FromArgb(100, 200, 100);
                 _lblVideoStatus.Text = $"{locationMsg} \u2014 restart game for changes";
                 _lblVideoStatus.ForeColor = Color.FromArgb(100, 200, 100);
+                ClearDirty();
             }
             catch (Exception ex)
             {
@@ -5952,6 +6086,79 @@ namespace OpenCompositeConfigurator
         private void BtnReload_Click(object? sender, EventArgs e)
         {
             LoadFromDir();
+            ClearDirty();   // reloaded state matches disk — no unsaved changes
+        }
+
+        private void MarkDirty()
+        {
+            if (_isLoading || _dirty) return;
+            _dirty = true;
+            _lblUnsavedBanner.Visible = true;
+            _lblUnsavedBanner.BringToFront();
+            _flashOn = true;
+            _lblUnsavedBanner.ForeColor = Color.FromArgb(255, 205, 60);
+            _breatheTimer.Start();
+        }
+
+        private void ClearDirty()
+        {
+            _dirty = false;
+            _breatheTimer.Stop();
+            _lblUnsavedBanner.Visible = false;
+        }
+
+        // Subscribe dirty-tracking to every settings input; skip the Bindings tab (own save + nav combos)
+        private void WireDirtyTracking(Control root)
+        {
+            foreach (Control c in root.Controls)
+            {
+                if (c == _tabKeyboard) continue;
+                if (c == _tabGestures) continue; // own save flow, not part of the ini
+                switch (c)
+                {
+                    case CheckBox cb:     cb.CheckedChanged += (s, e) => MarkDirty(); break;
+                    case RadioButton rb:  rb.CheckedChanged += (s, e) => MarkDirty(); break;
+                    case NumericUpDown n: n.ValueChanged += (s, e) => MarkDirty(); break;
+                    case TrackBar t:      t.ValueChanged += (s, e) => MarkDirty(); break;
+                    case ComboBox cmb:    cmb.SelectedIndexChanged += (s, e) => MarkDirty(); break;
+                    case TextBox tb:      tb.TextChanged += (s, e) => MarkDirty(); break;
+                }
+                if (c.HasChildren) WireDirtyTracking(c);
+            }
+        }
+
+        // Color-flash: alternate the big bold letters between gold and orange-red (~1Hz, attention-grabbing, not a strobe)
+        private void BreatheTimer_Tick(object? sender, EventArgs e)
+        {
+            _flashOn = !_flashOn;
+            _lblUnsavedBanner.ForeColor = _flashOn ? Color.FromArgb(255, 205, 60) : Color.FromArgb(235, 75, 40);
+        }
+
+        private static Color BannerLerp(Color a, Color b, double t)
+        {
+            return Color.FromArgb(
+                (int)(a.R + (b.R - a.R) * t),
+                (int)(a.G + (b.G - a.G) * t),
+                (int)(a.B + (b.B - a.B) * t));
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (_dirty)
+            {
+                var r = MessageBox.Show(
+                    "You have unsaved changes.\n\nSave before exiting?",
+                    "Unsaved Changes",
+                    MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+                if (r == DialogResult.Cancel)
+                    e.Cancel = true;
+                else if (r == DialogResult.Yes)
+                {
+                    BtnSave_Click(this, EventArgs.Empty);
+                    if (_dirty) e.Cancel = true;   // save didn't complete — keep window open, don't lose changes
+                }
+            }
+            base.OnFormClosing(e);
         }
 
         private void LoadFromDir()
@@ -6020,6 +6227,16 @@ namespace OpenCompositeConfigurator
 
             if (int.TryParse(_ini.Get("keyboard", "shortcutTiming", "500"), out int timing))
                 _nudTiming.Value = Math.Clamp(timing, 100, 3000);
+
+            string trackpadSwipe = _ini.Get("keyboard", "shortcutTrackpad", "none").ToLowerInvariant();
+            _cmbTrackpadSwipe.SelectedIndex = trackpadSwipe switch
+            {
+                "swipe_up" => 1, "swipe_down" => 2, _ => 0
+            };
+
+            _chkGestureSounds.Checked = ParseBool(_ini.Get("keyboard", "gestureSounds", "true"));
+            _cmbFinishSound.SelectedIndex =
+                _ini.Get("keyboard", "gestureFinishSound", "impact").ToLowerInvariant() == "dark" ? 1 : 0;
 
             if (TryParseIniFloat(_ini.Get("keyboard", "displayTilt", "22.5"), out float dt))
                 _nudDisplayTilt.Value = (decimal)Math.Clamp(dt, -30f, 80f);
@@ -6352,6 +6569,12 @@ namespace OpenCompositeConfigurator
             else mode = "double_tap";
             _ini.Set("keyboard", "shortcutMode", mode);
             _ini.Set("keyboard", "shortcutTiming", ((int)_nudTiming.Value).ToString());
+            _ini.Set("keyboard", "shortcutTrackpad", _cmbTrackpadSwipe.SelectedIndex switch
+            {
+                1 => "swipe_up", 2 => "swipe_down", _ => "none"
+            });
+            _ini.Set("keyboard", "gestureSounds", _chkGestureSounds.Checked ? "true" : "false");
+            _ini.Set("keyboard", "gestureFinishSound", _cmbFinishSound.SelectedIndex == 1 ? "dark" : "impact");
             _ini.Set("keyboard", "displayTilt", _nudDisplayTilt.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
             _ini.Set("keyboard", "displayOpacity", ((int)_nudDisplayOpacity.Value).ToString());
             _ini.Set("keyboard", "displayScale", ((int)_nudDisplayScale.Value).ToString());
@@ -6363,6 +6586,8 @@ namespace OpenCompositeConfigurator
             _ini.Set("", "supersampleRatio", _nudSuperSample.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
             _ini.Set("", "renderCustomHands", _chkRenderHands.Checked ? "true" : "false");
             _ini.Set("", "haptics", _chkHaptics.Checked ? "true" : "false");
+            // Always-visible control (both games) — must write unconditionally to match the unconditional read
+            _ini.Set("", "hapticStrength", _nudHapticStrength.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             _ini.Set("", "enableHiddenMeshFix", _chkHiddenMesh.Checked ? "true" : "false");
             _ini.Set("", "invertUsingShaders", _chkInvertShaders.Checked ? "true" : "false");
             _ini.Set("", "dx10Mode", _chkDx10.Checked ? "true" : "false");
@@ -6377,7 +6602,6 @@ namespace OpenCompositeConfigurator
 
             if (_gameType == "skyrim")
             {
-                _ini.Set("", "hapticStrength", _nudHapticStrength.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
                 _ini.Set("", "enableInputSmoothing", _chkInputSmoothing.Checked ? "true" : "false");
                 _ini.Set("", "inputWindowSize", ((int)_nudInputWindow.Value).ToString());
                 _ini.Set("", "enableControllerSmoothing", _chkControllerSmoothing.Checked ? "true" : "false");

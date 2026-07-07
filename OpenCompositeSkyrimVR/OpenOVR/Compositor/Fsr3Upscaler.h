@@ -59,6 +59,11 @@ public:
 	/// Get the DX11 texture containing the upscaled output for the given eye.
 	ID3D11Texture2D* GetOutputDX11(int eyeIdx) const;
 
+	/// Get the upscaled output of the last DispatchWarp for the given eye.
+	/// Warp (ASW synthetic frame) dispatches write to a separate buffer so they
+	/// never clobber the game-frame output returned by GetOutputDX11.
+	ID3D11Texture2D* GetWarpOutputDX11(int eyeIdx) const;
+
 	// --- Static jitter utilities (Halton[2,3] sequence, matches FSR convention) ---
 	static void GetJitterOffset(float* outX, float* outY, int frameIndex, int phaseCount);
 	static int  GetJitterPhaseCount(uint32_t renderWidth, uint32_t displayWidth);
@@ -122,18 +127,21 @@ private:
 		ID3D12Resource*  depthDX12 = nullptr;
 		ID3D12Resource*  reactiveDX12 = nullptr;
 		ID3D12Resource*  outputDX12[2] = {};    // double-buffered for async pipeline
+		ID3D12Resource*  warpOutputDX12 = nullptr; // ASW warp output — separate from game output
 
 		ID3D11Texture2D* colorDX11 = nullptr;
 		ID3D11Texture2D* mvDX11 = nullptr;
 		ID3D11Texture2D* depthDX11 = nullptr;
 		ID3D11Texture2D* reactiveDX11 = nullptr;
 		ID3D11Texture2D* outputDX11[2] = {};    // double-buffered for async pipeline
+		ID3D11Texture2D* warpOutputDX11 = nullptr;
 
 		HANDLE colorHandle = nullptr;
 		HANDLE mvHandle = nullptr;
 		HANDLE depthHandle = nullptr;
 		HANDLE reactiveHandle = nullptr;
 		HANDLE outputHandle[2] = {};             // double-buffered for async pipeline
+		HANDLE warpOutputHandle = nullptr;
 	};
 	SharedEyeTextures m_eye[2];
 

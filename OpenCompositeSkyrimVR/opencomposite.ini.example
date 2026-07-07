@@ -340,3 +340,10 @@
 ;   For long_press: how long you must hold the button
 ; Default: 500
 ;shortcutTiming=500
+
+; Index knuckles trackpad swipe to open the keyboard (either hand).
+; Touch your thumb to the trackpad and slide most of the pad height
+; within about half a second. Ignored on controllers without a trackpad.
+; Options: none | swipe_up | swipe_down
+; Default: none
+;shortcutTrackpad=none

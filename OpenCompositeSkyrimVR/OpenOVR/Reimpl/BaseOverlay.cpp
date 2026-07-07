@@ -17,6 +17,7 @@
 #include "generated/static_bases.gen.h"
 #include <algorithm>
 #include <direct.h>
+#include <map>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -181,6 +182,7 @@ static bool s_shortcutEnabled = true;
 static std::string s_shortcutButton = "left_stick";
 static std::string s_shortcutMode = "double_tap";
 static int s_shortcutTiming = 500;
+static std::string s_shortcutTrackpad = "none"; // none | swipe_up | swipe_down (Index trackpad)
 
 // Initialize shortcut settings from global config
 static void InitShortcutSettings()
@@ -189,6 +191,7 @@ static void InitShortcutSettings()
 	s_shortcutButton = oovr_global_configuration.KbShortcutButton();
 	s_shortcutMode = oovr_global_configuration.KbShortcutMode();
 	s_shortcutTiming = oovr_global_configuration.KbShortcutTiming();
+	s_shortcutTrackpad = oovr_global_configuration.KbShortcutTrackpad();
 }
 
 // Reload shortcut settings from INI file
@@ -232,6 +235,8 @@ static bool ReloadShortcutSettings()
 			s_shortcutMode = sval;
 		if (sscanf(line, "shortcutTiming=%d", &ival) == 1)
 			s_shortcutTiming = ival;
+		if (sscanf(line, "shortcutTrackpad=%255s", sval) == 1)
+			s_shortcutTrackpad = sval;
 	}
 	fclose(f);
 	return true;
@@ -602,6 +607,1098 @@ static int8_t ReadTextEntryCount(uintptr_t gameBase) noexcept
 	}
 	return 0;
 }
+
+// ============================================================================
+// GESTURE RECOGNIZER
+// Fires a keyboard scancode when a drawn controller motion matches a gesture
+// saved by the configurator (<game>\Gestures\*.json). Capture is gated on the
+// gesture's hold button; matching runs when the button releases. Templates
+// and live paths are resampled to 64 points, centered, and uniformly scaled,
+// then compared point-to-point ($1-recognizer style, no rotation invariance:
+// a Z and an N must stay different).
+// ============================================================================
+#include <algorithm>
+#include <fstream>
+#include <json/json.h>
+#include <mmsystem.h>
+
+// Trackpad state exported from BaseInput (updated by GetControllerState)
+extern float g_ocuTrackpadY[2];
+extern bool g_ocuTrackpadTouch[2];
+extern bool g_ocuTrackpadClick[2];
+
+namespace gestures {
+
+struct Pt {
+	float x, y;
+};
+
+struct GestureDef {
+	std::string name;
+	std::string hold; // l_trigger, r_stick, r_trackpad, ...
+	int scancode = 0;
+	int vk = 0;
+	int action = 0; // 0 = press key, 1 = cast spell instantly, 2 = equip left hand, 3 = equip right hand
+	std::string spellPlugin;   // source plugin file (load-order independent)
+	uint32_t spellFormId = 0;  // LOCAL form id within that plugin
+	bool concentration = false; // spell streams while held (Flames-style) — channels instead of one-shot
+	float trailRGB[3] = { 0.2f, 0.78f, 1.0f };
+	float runeRGB[3] = { 0.2f, 0.78f, 1.0f }; // pulse-flash color once the shape completes (defaults to trail color)
+	float trailWidth = 1.0f; // stroke thickness multiplier (0.6 thin … 2.2 massive)
+	uint8_t trailStyle = 8; // bit flags: 1 transparent, 2 smoky, 4 wispy, 8 glowing
+	std::vector<Pt> hand[2]; // concatenated template strokes per hand (0=L, 1=R)
+};
+
+// Handed by pointer to the SKSE plugin (same process). Layout must match
+// OCGestureCastRequest in the plugin's Main.cpp.
+struct OCGestureCastRequest {
+	char plugin[128];
+	uint32_t formId;
+	int mode; // 0 = cast instantly, 1 = equip left, 2 = equip right, 3 = start held stream, 4 = stop held stream
+	int hand; // casting hand: 0 = left, 1 = right (the hand that drew the gesture)
+};
+
+static void TrailColorFromName(const std::string& name, float rgb[3])
+{
+	struct NamedColor { const char* n; float r, g, b; };
+	static const NamedColor kColors[] = {
+		{ "cyan", 0.20f, 0.78f, 1.00f }, { "blue", 0.25f, 0.42f, 1.00f },
+		{ "purple", 0.62f, 0.32f, 1.00f }, { "green", 0.30f, 1.00f, 0.42f },
+		{ "orange", 1.00f, 0.55f, 0.15f }, { "red", 1.00f, 0.25f, 0.20f },
+		{ "pink", 1.00f, 0.42f, 0.75f }, { "white", 1.00f, 1.00f, 1.00f },
+		{ "gold", 1.00f, 0.84f, 0.30f }, { "black", 0.06f, 0.05f, 0.10f },
+	};
+	for (const auto& c : kColors) {
+		if (name == c.n) {
+			rgb[0] = c.r;
+			rgb[1] = c.g;
+			rgb[2] = c.b;
+			return;
+		}
+	}
+	rgb[0] = 0.20f;
+	rgb[1] = 0.78f;
+	rgb[2] = 1.00f;
+}
+
+static std::vector<GestureDef> s_defs;
+static ULONGLONG s_nextScan = 0;
+static ULONGLONG s_dirStamp = 0; // combined file count + newest write time
+static ULONGLONG s_cooldownUntil = 0;
+
+static std::wstring DirPath()
+{
+	wchar_t exePath[MAX_PATH];
+	GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+	std::wstring p(exePath);
+	size_t pos = p.find_last_of(L"\\/");
+	if (pos != std::wstring::npos)
+		p = p.substr(0, pos + 1);
+	return p + L"Gestures";
+}
+
+static void ParseStrokes(const Json::Value& arr, std::vector<Pt>& out)
+{
+	if (!arr.isArray())
+		return;
+	for (const auto& stroke : arr) {
+		if (!stroke.isArray())
+			continue;
+		for (const auto& p : stroke) {
+			if (p.isArray() && p.size() >= 2)
+				out.push_back({ p[0].asFloat(), p[1].asFloat() });
+		}
+	}
+}
+
+static void LoadGestures()
+{
+	s_defs.clear();
+	std::wstring dir = DirPath();
+	WIN32_FIND_DATAW fd;
+	HANDLE find = FindFirstFileW((dir + L"\\*.json").c_str(), &fd);
+	if (find == INVALID_HANDLE_VALUE)
+		return;
+
+	do {
+		std::wstring path = dir + L"\\" + fd.cFileName;
+		std::ifstream file(path);
+		if (!file.is_open())
+			continue;
+
+		Json::Value root;
+		Json::CharReaderBuilder builder;
+		std::string errs;
+		if (!Json::parseFromStream(builder, file, &root, &errs))
+			continue;
+
+		GestureDef def;
+		def.name = root.get("Name", "").asString();
+		def.hold = root.get("HoldButton", "").asString();
+		def.scancode = root.get("Scancode", 0).asInt();
+		def.vk = root.get("Vk", 0).asInt();
+		std::string action = root.get("Action", "key").asString();
+		def.action = action == "spell" ? 1 : action == "equip_left" ? 2 : action == "equip_right" ? 3 : 0;
+		def.spellPlugin = root.get("SpellPlugin", "").asString();
+		std::string formStr = root.get("SpellFormId", "").asString();
+		if (!formStr.empty())
+			def.spellFormId = (uint32_t)strtoul(formStr.c_str(), nullptr, 0); // handles 0x prefix
+		if (def.action != 0 && (def.spellPlugin.empty() || def.spellFormId == 0)) {
+			OOVR_LOGF("Gestures: '%s' is a spell gesture without a valid spell — treating as key", def.name.c_str());
+			def.action = 0;
+		}
+		def.concentration = root.get("Concentration", false).asBool();
+		def.trailWidth = root.get("TrailWidth", 1.0f).asFloat();
+		if (def.trailWidth < 0.3f || def.trailWidth > 4.0f)
+			def.trailWidth = 1.0f;
+		TrailColorFromName(root.get("TrailColor", "cyan").asString(), def.trailRGB);
+		std::string runeColor = root.get("RuneColor", "").asString();
+		if (!runeColor.empty())
+			TrailColorFromName(runeColor, def.runeRGB);
+		else
+			memcpy(def.runeRGB, def.trailRGB, sizeof(def.runeRGB));
+		def.trailStyle = 0;
+		if (root["TrailStyle"].isArray()) {
+			for (const auto& s : root["TrailStyle"]) {
+				std::string v = s.asString();
+				if (v == "transparent") def.trailStyle |= 1;
+				else if (v == "smoky") def.trailStyle |= 2;
+				else if (v == "wispy") def.trailStyle |= 4;
+				else if (v == "glowing") def.trailStyle |= 8;
+			}
+		}
+		if (def.trailStyle == 0)
+			def.trailStyle = 8;
+		ParseStrokes(root["Left"], def.hand[0]);
+		ParseStrokes(root["Right"], def.hand[1]);
+
+		// Migrate pre-split hold ids (hand-agnostic) to the drawing hand
+		if (!def.hold.empty() && def.hold[0] != 'l' && def.hold[0] != 'r') {
+			bool leftOnly = !def.hand[0].empty() && def.hand[1].empty();
+			def.hold = (leftOnly ? std::string("l_") : std::string("r_")) + def.hold;
+		}
+
+		// v1: hold-gated gestures only. Always-listening needs continuous
+		// matching and a much stricter threshold; not worth the misfires yet.
+		if (def.hold.empty()) {
+			OOVR_LOGF("Gestures: '%s' has no hold button — skipped (not supported yet)", def.name.c_str());
+			continue;
+		}
+		if (def.hand[0].size() < 2 && def.hand[1].size() < 2)
+			continue;
+
+		s_defs.push_back(std::move(def));
+	} while (FindNextFileW(find, &fd));
+	FindClose(find);
+
+	OOVR_LOGF("Gestures: loaded %zu gesture(s) from Gestures folder", s_defs.size());
+	for (const auto& d : s_defs)
+		OOVR_LOGF("Gestures:   '%s' hold=%s action=%d key=0x%02X spell=%s/0x%X",
+		    d.name.c_str(), d.hold.c_str(), d.action, d.scancode,
+		    d.spellPlugin.c_str(), d.spellFormId);
+}
+
+// Cheap change detection: file count + newest write time, checked every 3s.
+// Lets the configurator hot-add gestures while the game runs.
+static void MaybeReload()
+{
+	ULONGLONG now = GetTickCount64();
+	if (now < s_nextScan)
+		return;
+	s_nextScan = now + 3000;
+
+	ULONGLONG stamp = 0;
+	WIN32_FIND_DATAW fd;
+	HANDLE find = FindFirstFileW((DirPath() + L"\\*.json").c_str(), &fd);
+	if (find != INVALID_HANDLE_VALUE) {
+		do {
+			ULARGE_INTEGER t;
+			t.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+			t.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+			stamp += t.QuadPart / 10000000ULL; // seconds granularity
+			stamp += 1; // count contribution
+		} while (FindNextFileW(find, &fd));
+		FindClose(find);
+	}
+
+	if (stamp != s_dirStamp) {
+		s_dirStamp = stamp;
+		LoadGestures();
+	}
+}
+
+static bool HoldHeld(const std::string& hold, VRControllerState_t st[2], const bool valid[2])
+{
+	if (hold.size() < 3)
+		return false;
+	int h = (hold[0] == 'l') ? 0 : 1;
+	if (!valid[h])
+		return false;
+	const char* btn = hold.c_str() + 2;
+	if (!strcmp(btn, "trigger"))
+		return (st[h].ulButtonPressed & ButtonMaskFromId(k_EButton_Axis1)) != 0 || st[h].rAxis[1].x >= 0.5f;
+	if (!strcmp(btn, "grip"))
+		return (st[h].ulButtonPressed & ButtonMaskFromId(k_EButton_Grip)) != 0 || st[h].rAxis[2].x >= 0.5f;
+	if (!strcmp(btn, "a"))
+		return (st[h].ulButtonPressed & ButtonMaskFromId(k_EButton_A)) != 0;
+	if (!strcmp(btn, "b"))
+		return (st[h].ulButtonPressed & ButtonMaskFromId(k_EButton_ApplicationMenu)) != 0;
+	if (!strcmp(btn, "stick"))
+		return (st[h].ulButtonPressed & ButtonMaskFromId(k_EButton_SteamVR_Touchpad)) != 0;
+	if (!strcmp(btn, "trackpad"))
+		return g_ocuTrackpadClick[h];
+	return false;
+}
+
+// Resample to N points by arc length, center on centroid, scale uniformly so
+// the larger extent is 1. Output is comparable point-to-point.
+static constexpr int kSamples = 64;
+
+static bool NormalizePath(const std::vector<Pt>& in, Pt out[kSamples])
+{
+	if (in.size() < 2)
+		return false;
+
+	float total = 0;
+	for (size_t i = 1; i < in.size(); i++)
+		total += hypotf(in[i].x - in[i - 1].x, in[i].y - in[i - 1].y);
+	if (total < 1e-5f)
+		return false;
+
+	float step = total / (kSamples - 1);
+	out[0] = in[0];
+	int outIdx = 1;
+	float acc = 0;
+	for (size_t i = 1; i < in.size() && outIdx < kSamples; i++) {
+		Pt a = in[i - 1], b = in[i];
+		float seg = hypotf(b.x - a.x, b.y - a.y);
+		while (acc + seg >= step && outIdx < kSamples) {
+			float t = (step - acc) / seg;
+			Pt np = { a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t };
+			out[outIdx++] = np;
+			seg -= (step - acc);
+			a = np;
+			acc = 0;
+		}
+		acc += seg;
+	}
+	while (outIdx < kSamples)
+		out[outIdx++] = in.back();
+
+	float cx = 0, cy = 0;
+	for (int i = 0; i < kSamples; i++) {
+		cx += out[i].x;
+		cy += out[i].y;
+	}
+	cx /= kSamples;
+	cy /= kSamples;
+
+	float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+	for (int i = 0; i < kSamples; i++) {
+		out[i].x -= cx;
+		out[i].y -= cy;
+		minX = std::min(minX, out[i].x);
+		maxX = std::max(maxX, out[i].x);
+		minY = std::min(minY, out[i].y);
+		maxY = std::max(maxY, out[i].y);
+	}
+	float extent = std::max(maxX - minX, maxY - minY);
+	if (extent < 1e-5f)
+		return false;
+	for (int i = 0; i < kSamples; i++) {
+		out[i].x /= extent;
+		out[i].y /= extent;
+	}
+	return true;
+}
+
+// 0..1, higher is better. 0.707 = half-diagonal of the unit box.
+static float MatchScore(const Pt a[kSamples], const Pt b[kSamples])
+{
+	float sum = 0;
+	for (int i = 0; i < kSamples; i++)
+		sum += hypotf(a[i].x - b[i].x, a[i].y - b[i].y);
+	return 1.0f - (sum / kSamples) / 0.707f;
+}
+
+// Gesture key press with real duration. Preferred delivery: through the SKSE
+// plugin into Skyrim's own input event queue (WM_OC_KB wParam 4 = down,
+// 5 = up, lParam = scancode). SendInput proved unreliable here: injected
+// keystrokes never reached SKSE hotkey listeners even with focus forced and
+// a 60ms hold. SendInput remains only as a no-plugin fallback.
+static constexpr UINT WM_OC_KB_GESTURE = WM_APP + 0x4F43;
+static int s_pendingUpScancode = 0;
+static ULONGLONG s_pendingUpAt = 0;
+static bool s_pendingUpViaPlugin = false;
+
+static void SendScancodeEvent(int scancode, bool up)
+{
+	INPUT in = {};
+	in.type = INPUT_KEYBOARD;
+	in.ki.wScan = (WORD)scancode;
+	in.ki.dwFlags = KEYEVENTF_SCANCODE | (up ? KEYEVENTF_KEYUP : 0);
+	SendInput(1, &in, sizeof(INPUT));
+}
+
+// Prisma direct delivery: panels only hear keys in their JS when the view has
+// focus, so injected (and even physical) keys can be silently eaten. This
+// export delivers straight to the panel regardless of focus. Same channel
+// the VR keyboard uses; resolved lazily, null when PrismaUI is not loaded.
+typedef void (*PrismaVR_DeliverVKeyFn)(int);
+static PrismaVR_DeliverVKeyFn GetPrismaDeliverVKey()
+{
+	static PrismaVR_DeliverVKeyFn cached = nullptr;
+	static bool resolved = false;
+	if (!resolved) {
+		resolved = true;
+		if (HMODULE prisma = GetModuleHandleW(L"PrismaUI.dll"))
+			cached = reinterpret_cast<PrismaVR_DeliverVKeyFn>(GetProcAddress(prisma, "PrismaVR_DeliverVKey"));
+	}
+	return cached;
+}
+
+static void FireGestureKey(int scancode, int vk)
+{
+	HWND hwnd = GetGameWindowLocal();
+	if (hwnd) {
+		PostMessageW(hwnd, WM_OC_KB_GESTURE, 4, (LPARAM)scancode);
+		s_pendingUpViaPlugin = true;
+	} else {
+		SendScancodeEvent(scancode, false);
+		s_pendingUpViaPlugin = false;
+	}
+	s_pendingUpScancode = scancode;
+	s_pendingUpAt = GetTickCount64() + 60;
+
+	// Prisma JS listeners get the key directly (game listeners never see this)
+	if (vk) {
+		if (auto deliver = GetPrismaDeliverVKey()) {
+			deliver(vk);
+			OOVR_LOGF("Gesture key: also delivered vk 0x%02X directly to Prisma", vk);
+		}
+	}
+}
+
+// ─── Cast sounds ─────────────────────────────────────────────────────────
+// Magictrace.wav loops while the trail traces (starts once the hand actually
+// moves, so arming alone stays silent); on release a successful cast plays
+// the configured finish sound. Files live in the Gestures folder beside the
+// gesture JSONs so Root Builder deploys them with everything else.
+#pragma comment(lib, "winmm.lib")
+
+static bool s_traceSoundOn = false;
+static float s_capArc[2] = { 0, 0 };
+
+static std::wstring GestureSoundPath(const wchar_t* file)
+{
+	return DirPath() + L"\\" + file;
+}
+
+static void StartTraceSound()
+{
+	if (s_traceSoundOn || !oovr_global_configuration.KbGestureSounds())
+		return;
+	PlaySoundW(GestureSoundPath(L"Magictrace.wav").c_str(), nullptr,
+	    SND_FILENAME | SND_ASYNC | SND_LOOP | SND_NODEFAULT);
+	s_traceSoundOn = true;
+}
+
+static void StopTraceSound(bool playFinish)
+{
+	if (s_traceSoundOn) {
+		PlaySoundW(nullptr, nullptr, 0);
+		s_traceSoundOn = false;
+	}
+	if (playFinish && oovr_global_configuration.KbGestureSounds()) {
+		const wchar_t* file = (oovr_global_configuration.KbGestureFinishSound() == "dark")
+		    ? L"Dark.wav"
+		    : L"Impact.wav";
+		PlaySoundW(GestureSoundPath(file).c_str(), nullptr,
+		    SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+	}
+}
+
+// ─── Trail overlay state (rendering functions live below Update) ────────
+static constexpr int kTrailTex = 512;
+static constexpr float kTrailQuadSize = 1.6f; // meters; hand offsets map 1:1 onto it
+static constexpr float kTrailDistance = 1.0f; // meters in front of the capture-time head
+
+enum class TrailPhase { Idle,
+	Drawing,
+	Fade };
+static TrailPhase s_trailPhase = TrailPhase::Idle;
+static bool s_trailSuccess = false;
+static ULONGLONG s_trailT0 = 0;
+static float s_trailRGB[3] = { 0.2f, 0.78f, 1.0f };
+static float s_trailWidth = 1.0f;
+static uint8_t s_trailStyle = 8;
+static std::vector<Pt> s_trailPath[2];
+static XrPosef s_trailPose = {};
+static XrSwapchain s_trailChain = XR_NULL_HANDLE;
+static std::vector<XrSwapchainImageD3D11KHR> s_trailImages;
+static XrCompositionLayerQuad s_trailLayer;
+static uint32_t* s_trailPixels = nullptr;
+
+static XrQuaternionf QuatFromHmdMatrix(const HmdMatrix34_t& m)
+{
+	XrQuaternionf q;
+	float trace = m.m[0][0] + m.m[1][1] + m.m[2][2];
+	if (trace > 0.0f) {
+		float s = sqrtf(trace + 1.0f) * 2.0f;
+		q.w = 0.25f * s;
+		q.x = (m.m[2][1] - m.m[1][2]) / s;
+		q.y = (m.m[0][2] - m.m[2][0]) / s;
+		q.z = (m.m[1][0] - m.m[0][1]) / s;
+	} else if (m.m[0][0] > m.m[1][1] && m.m[0][0] > m.m[2][2]) {
+		float s = sqrtf(1.0f + m.m[0][0] - m.m[1][1] - m.m[2][2]) * 2.0f;
+		q.w = (m.m[2][1] - m.m[1][2]) / s;
+		q.x = 0.25f * s;
+		q.y = (m.m[0][1] + m.m[1][0]) / s;
+		q.z = (m.m[0][2] + m.m[2][0]) / s;
+	} else if (m.m[1][1] > m.m[2][2]) {
+		float s = sqrtf(1.0f + m.m[1][1] - m.m[0][0] - m.m[2][2]) * 2.0f;
+		q.w = (m.m[0][2] - m.m[2][0]) / s;
+		q.x = (m.m[0][1] + m.m[1][0]) / s;
+		q.y = 0.25f * s;
+		q.z = (m.m[1][2] + m.m[2][1]) / s;
+	} else {
+		float s = sqrtf(1.0f + m.m[2][2] - m.m[0][0] - m.m[1][1]) * 2.0f;
+		q.w = (m.m[1][0] - m.m[0][1]) / s;
+		q.x = (m.m[0][2] + m.m[2][0]) / s;
+		q.y = (m.m[1][2] + m.m[2][1]) / s;
+		q.z = 0.25f * s;
+	}
+	return q;
+}
+
+// Capture session: hand paths in the HMD-local plane captured at hold start.
+// The frame is frozen at capture start so turning your head mid-gesture does
+// not warp the drawing.
+struct Capture {
+	bool active = false;
+	std::string hold;
+	float origin[3];
+	float right[3], up[3];
+	std::vector<Pt> path[2];
+	ULONGLONG start = 0;
+};
+static Capture s_cap;
+
+// Stream state for concentration-spell gestures (Flames-style): releasing
+// the hold secures the shape and starts a guaranteed 2s burst; holding the
+// casting hand's trigger extends the stream for as long as it stays down
+// ("continuance"). We must stop the caster explicitly — an unstopped
+// concentration stream flows and drains magicka until empty.
+static bool s_streaming = false;
+static char s_streamPlugin[128] = {};
+static uint32_t s_streamFormId = 0;
+static int s_streamHand = 1;
+static ULONGLONG s_streamStartedAt = 0;
+
+// Score the captured drawing against the templates on this hold button.
+// concentrationOnly restricts candidates to channel-capable spell gestures
+// (the mid-hold early match); quiet suppresses the per-candidate log lines.
+static const GestureDef* MatchCapture(const Capture& cap, const float arc[2], bool concentrationOnly, bool quiet, float& bestScore)
+{
+	Pt liveNorm[2][kSamples];
+	bool liveOk[2] = { false, false };
+	for (int h = 0; h < 2; h++)
+		if (arc[h] > 0.12f && cap.path[h].size() >= 8)
+			liveOk[h] = NormalizePath(cap.path[h], liveNorm[h]);
+
+	bestScore = 0;
+	if (!liveOk[0] && !liveOk[1])
+		return nullptr;
+
+	const GestureDef* best = nullptr;
+	for (const auto& def : s_defs) {
+		if (def.hold != cap.hold)
+			continue;
+		if (concentrationOnly && !(def.concentration && def.action == 1))
+			continue;
+		float score = 0;
+		int hands = 0;
+		bool ok = true;
+		for (int h = 0; h < 2; h++) {
+			if (def.hand[h].size() < 2)
+				continue;
+			Pt tmplNorm[kSamples];
+			if (!liveOk[h] || !NormalizePath(def.hand[h], tmplNorm)) {
+				ok = false;
+				break;
+			}
+			score += MatchScore(liveNorm[h], tmplNorm);
+			hands++;
+		}
+		if (!ok) {
+			if (!quiet)
+				OOVR_LOGF("Gesture: '%s' needs a hand you did not draw with — skipped", def.name.c_str());
+			continue;
+		}
+		if (hands == 0)
+			continue;
+		score /= hands;
+		if (!quiet)
+			OOVR_LOGF("Gesture: candidate '%s' score %.2f", def.name.c_str(), score);
+		if (score > bestScore) {
+			bestScore = score;
+			best = &def;
+		}
+	}
+	return best;
+}
+
+static void GetPos(const HmdMatrix34_t& m, float out[3])
+{
+	out[0] = m.m[0][3];
+	out[1] = m.m[1][3];
+	out[2] = m.m[2][3];
+}
+
+static void Update(BaseSystem* sys, bool keyboardOpen)
+{
+	// Release a pending gesture keypress even if gestures get disabled mid-hold
+	if (s_pendingUpScancode && GetTickCount64() >= s_pendingUpAt) {
+		HWND hwnd = s_pendingUpViaPlugin ? GetGameWindowLocal() : nullptr;
+		if (s_pendingUpViaPlugin && hwnd)
+			PostMessageW(hwnd, WM_OC_KB_GESTURE, 5, (LPARAM)s_pendingUpScancode);
+		else
+			SendScancodeEvent(s_pendingUpScancode, true);
+		s_pendingUpScancode = 0;
+	}
+
+	if (!oovr_global_configuration.KbGesturesEnabled())
+		return;
+	MaybeReload();
+	if (s_defs.empty())
+		return;
+
+	ULONGLONG now = GetTickCount64();
+	if (keyboardOpen || now < s_cooldownUntil) {
+		// Gestures pause while the VR keyboard is open — say so, once per episode
+		static bool s_loggedKbPause = false;
+		if (keyboardOpen && !s_loggedKbPause) {
+			s_loggedKbPause = true;
+			OOVR_LOG("Gesture: paused while VR keyboard is open (close it to cast)");
+		}
+		if (!keyboardOpen)
+			s_loggedKbPause = false;
+		// A capture interrupted mid-draw fades its trail out quietly
+		if (s_cap.active && s_trailPhase == TrailPhase::Drawing) {
+			s_trailPhase = TrailPhase::Fade;
+			s_trailSuccess = false;
+			s_trailT0 = now;
+			StopTraceSound(false);
+		}
+		s_cap.active = false;
+		return;
+	}
+
+	// Controller states (also refreshes the exported trackpad values)
+	VRControllerState_t st[2] = {};
+	bool valid[2] = { false, false };
+	TrackedDeviceIndex_t handIdx[2] = {
+		sys->GetTrackedDeviceIndexForControllerRole(TrackedControllerRole_LeftHand),
+		sys->GetTrackedDeviceIndexForControllerRole(TrackedControllerRole_RightHand)
+	};
+	for (int h = 0; h < 2; h++)
+		if (handIdx[h] != k_unTrackedDeviceIndexInvalid)
+			valid[h] = sys->GetControllerState(handIdx[h], &st[h], sizeof(st[h]));
+
+	// Active stream: the engine keeps it flowing (and drains magicka) until
+	// we stop it. Guaranteed 2s burst, then it survives only while the
+	// casting hand's trigger is held — the same button that sustains a
+	// normal cast. 30s safety cap in case a trigger reads stuck.
+	if (s_streaming) {
+		bool burstDone = now - s_streamStartedAt >= 2000;
+		bool continuing = HoldHeld(s_streamHand == 0 ? "l_trigger" : "r_trigger", st, valid);
+		bool timedOut = now - s_streamStartedAt > 30000;
+		if (timedOut || (burstDone && !continuing)) {
+			s_streaming = false;
+			s_cooldownUntil = now + 600;
+			HWND hwnd = GetGameWindowLocal();
+			if (hwnd) {
+				static OCGestureCastRequest s_stopRequest;
+				memset(s_stopRequest.plugin, 0, sizeof(s_stopRequest.plugin));
+				strncpy_s(s_stopRequest.plugin, s_streamPlugin, _TRUNCATE);
+				s_stopRequest.formId = s_streamFormId;
+				s_stopRequest.mode = 4; // stop stream
+				s_stopRequest.hand = s_streamHand;
+				PostMessageW(hwnd, WM_OC_KB_GESTURE, 6, (LPARAM)&s_stopRequest);
+			}
+			OOVR_LOGF("Gesture: stream ends (%s after %.1fs)",
+			    timedOut ? "30s safety cap" : "burst done, trigger not held",
+			    (now - s_streamStartedAt) / 1000.0f);
+		}
+		return;
+	}
+
+	// Rising-edge tracking for hold buttons: arming requires PRESSING the
+	// button while a hand is already raised. A button that was already down
+	// when the hand came up (grabbing something low and lifting it) must
+	// never start a cast.
+	static std::map<std::string, bool> s_holdWasDown;
+	std::map<std::string, bool> holdPrev;
+	std::swap(holdPrev, s_holdWasDown);
+	for (const auto& def : s_defs)
+		if (!s_holdWasDown.count(def.hold))
+			s_holdWasDown[def.hold] = HoldHeld(def.hold, st, valid);
+
+	if (!s_cap.active) {
+		// Start a capture on a FRESH press of a referenced hold button while
+		// a hand is raised high (above head + armHeight). The height gate is
+		// what keeps grips during normal play from arming casts (and
+		// spamming the trace sound).
+		for (const auto& def : s_defs) {
+			if (s_holdWasDown[def.hold] && !holdPrev[def.hold]) {
+				TrackedDevicePose_t poses[k_unMaxTrackedDeviceCount];
+				sys->GetDeviceToAbsoluteTrackingPose(TrackingUniverseStanding, 0, poses, k_unMaxTrackedDeviceCount);
+				if (!poses[k_unTrackedDeviceIndex_Hmd].bPoseIsValid) {
+					OOVR_LOG("Gesture: hold detected but HMD pose invalid — capture not started");
+					return;
+				}
+
+				// Arm gate: EITHER hand raised high (default: forehead level)
+				// arms the cast — drawing hand or holding hand, whichever the
+				// player instinctively lifts. Blocked attempts log (throttled)
+				// so a too-low hand is never an invisible failure.
+				{
+					float headY = poses[k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking.m[1][3];
+					float armY = headY + oovr_global_configuration.KbGestureArmHeight();
+					bool raised = false;
+					float bestY = -100.0f;
+					for (int h = 0; h < 2; h++) {
+						if (handIdx[h] == k_unTrackedDeviceIndexInvalid || !poses[handIdx[h]].bPoseIsValid)
+							continue;
+						float hy = poses[handIdx[h]].mDeviceToAbsoluteTracking.m[1][3];
+						bestY = std::max(bestY, hy);
+						if (hy >= armY)
+							raised = true;
+					}
+					if (!raised) {
+						static ULONGLONG s_lastGateLog = 0;
+						if (now - s_lastGateLog > 2000) {
+							s_lastGateLog = now;
+							OOVR_LOGF("Gesture: hold held but no hand raised (best %.2fm below arm height) — raise a hand to %.2fm above head to arm",
+							    armY - bestY, oovr_global_configuration.KbGestureArmHeight());
+						}
+						continue; // hold held, but hands too low — stay disarmed
+					}
+				}
+
+				const auto& hm = poses[k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking;
+				s_cap = Capture{};
+				s_cap.active = true;
+				s_cap.hold = def.hold;
+				s_cap.start = now;
+				GetPos(hm, s_cap.origin);
+				// HMD basis columns: 0 = right, 1 = up
+				for (int r = 0; r < 3; r++) {
+					s_cap.right[r] = hm.m[r][0];
+					s_cap.up[r] = hm.m[r][1];
+				}
+
+				// Trail overlay: frozen quad at the capture plane, styled by
+				// the (first) gesture on this hold button
+				s_trailRGB[0] = def.trailRGB[0];
+				s_trailRGB[1] = def.trailRGB[1];
+				s_trailRGB[2] = def.trailRGB[2];
+				s_trailWidth = def.trailWidth;
+				s_trailStyle = def.trailStyle;
+				s_trailPath[0].clear();
+				s_trailPath[1].clear();
+				s_trailPose.position = {
+					s_cap.origin[0] - hm.m[0][2] * kTrailDistance,
+					s_cap.origin[1] - hm.m[1][2] * kTrailDistance,
+					s_cap.origin[2] - hm.m[2][2] * kTrailDistance
+				};
+				s_trailPose.orientation = QuatFromHmdMatrix(hm);
+				s_trailPhase = TrailPhase::Drawing;
+				s_trailSuccess = false;
+				s_trailT0 = now;
+				s_capArc[0] = s_capArc[1] = 0;
+
+				OOVR_LOGF("Gesture: capture started (hold=%s, hand raised)", s_cap.hold.c_str());
+				break;
+			}
+		}
+		return;
+	}
+
+	// Active capture: bail out if it runs absurdly long
+	if (now - s_cap.start > 10000) {
+		OOVR_LOG("Gesture: capture timed out after 10s — cancelled");
+		s_cap.active = false;
+		s_trailPhase = TrailPhase::Fade;
+		s_trailSuccess = false;
+		s_trailT0 = now;
+		StopTraceSound(false);
+		return;
+	}
+
+	bool stillHeld = HoldHeld(s_cap.hold, st, valid);
+
+	// Append current hand positions projected into the frozen HMD plane
+	{
+		TrackedDevicePose_t poses[k_unMaxTrackedDeviceCount];
+		sys->GetDeviceToAbsoluteTrackingPose(TrackingUniverseStanding, 0, poses, k_unMaxTrackedDeviceCount);
+		for (int h = 0; h < 2; h++) {
+			if (handIdx[h] == k_unTrackedDeviceIndexInvalid || !poses[handIdx[h]].bPoseIsValid)
+				continue;
+			float p[3];
+			GetPos(poses[handIdx[h]].mDeviceToAbsoluteTracking, p);
+			float d[3] = { p[0] - s_cap.origin[0], p[1] - s_cap.origin[1], p[2] - s_cap.origin[2] };
+			// Canvas convention: x right, y DOWN (matches the configurator)
+			Pt pt = {
+				d[0] * s_cap.right[0] + d[1] * s_cap.right[1] + d[2] * s_cap.right[2],
+				-(d[0] * s_cap.up[0] + d[1] * s_cap.up[1] + d[2] * s_cap.up[2])
+			};
+			auto& path = s_cap.path[h];
+			if (path.empty() || hypotf(pt.x - path.back().x, pt.y - path.back().y) > 0.005f) {
+				if (!path.empty())
+					s_capArc[h] += hypotf(pt.x - path.back().x, pt.y - path.back().y);
+				path.push_back(pt);
+				s_trailPath[h].push_back(pt); // live mirror for the trail overlay
+			}
+		}
+
+		// Trace sound starts once the hand genuinely moves, not on arm alone
+		if (!s_traceSoundOn && (s_capArc[0] + s_capArc[1]) > 0.05f)
+			StartTraceSound();
+	}
+
+	if (stillHeld)
+		return;
+
+	// Hold released: match against gestures with this hold button
+	Capture cap = std::move(s_cap);
+	s_cap.active = false;
+
+	// Per-hand arc length (deliberate motion filter: > 12cm)
+	float arc[2] = { 0, 0 };
+	for (int h = 0; h < 2; h++)
+		for (size_t i = 1; i < cap.path[h].size(); i++)
+			arc[h] += hypotf(cap.path[h][i].x - cap.path[h][i - 1].x, cap.path[h][i].y - cap.path[h][i - 1].y);
+
+	OOVR_LOGF("Gesture: capture ended (hold=%s) — left %.2fm/%zu pts, right %.2fm/%zu pts",
+	    cap.hold.c_str(), arc[0], cap.path[0].size(), arc[1], cap.path[1].size());
+
+	if ((arc[0] <= 0.12f || cap.path[0].size() < 8) && (arc[1] <= 0.12f || cap.path[1].size() < 8)) {
+		OOVR_LOG("Gesture: no deliberate drawing motion (need > 0.12m of hand travel) — ignored");
+		s_trailPhase = TrailPhase::Fade;
+		s_trailSuccess = false;
+		s_trailT0 = now;
+		StopTraceSound(false);
+		return;
+	}
+
+	float bestScore = 0;
+	const GestureDef* best = MatchCapture(cap, arc, false, false, bestScore);
+
+	float threshold = oovr_global_configuration.KbGestureThreshold();
+	bool cast = false;
+	if (best && bestScore >= threshold) {
+		if (best->action != 0) {
+			// Spell action: hand the request to the SKSE plugin (same process)
+			static OCGestureCastRequest s_castRequest;
+			HWND hwnd = GetGameWindowLocal();
+			if (hwnd) {
+				memset(s_castRequest.plugin, 0, sizeof(s_castRequest.plugin));
+				strncpy_s(s_castRequest.plugin, best->spellPlugin.c_str(), _TRUNCATE);
+				s_castRequest.formId = best->spellFormId;
+				s_castRequest.mode = best->action - 1;
+				s_castRequest.hand = arc[0] >= arc[1] ? 0 : 1; // cast from the hand that drew
+				if (best->action == 1 && best->concentration) {
+					// Stream spell: start it (mode 3) and take over stop duty —
+					// guaranteed 2s burst, extended while that hand's trigger
+					// is held, stopped by the s_streaming block above.
+					s_castRequest.mode = 3;
+					memset(s_streamPlugin, 0, sizeof(s_streamPlugin));
+					strncpy_s(s_streamPlugin, best->spellPlugin.c_str(), _TRUNCATE);
+					s_streamFormId = best->spellFormId;
+					s_streamHand = s_castRequest.hand;
+					s_streamStartedAt = now;
+					s_streaming = true;
+				}
+				PostMessageW(hwnd, WM_OC_KB_GESTURE, 6, (LPARAM)&s_castRequest);
+				s_cooldownUntil = now + 600;
+				cast = true;
+				OOVR_LOGF("Gesture '%s' matched (score %.2f) — %s spell 0x%X from '%s'",
+				    best->name.c_str(), bestScore,
+				    best->action == 1 ? "casting" : "equipping",
+				    best->spellFormId, best->spellPlugin.c_str());
+			} else {
+				OOVR_LOGF("Gesture '%s' matched but no game window for spell cast", best->name.c_str());
+			}
+		} else {
+			int sc = best->scancode;
+			if (!sc && best->vk)
+				sc = (int)MapVirtualKeyW(best->vk, MAPVK_VK_TO_VSC);
+			if (sc) {
+				int vk = best->vk ? best->vk : (int)MapVirtualKeyW(sc, MAPVK_VSC_TO_VK);
+				FireGestureKey(sc, vk);
+				s_cooldownUntil = now + 600;
+				cast = true;
+				OOVR_LOGF("Gesture '%s' matched (score %.2f) — fired scancode 0x%02X (60ms hold)",
+				    best->name.c_str(), bestScore, sc);
+			} else {
+				OOVR_LOGF("Gesture '%s' matched (score %.2f) but has no key bound", best->name.c_str(), bestScore);
+			}
+		}
+	} else if (best) {
+		OOVR_LOGF("Gesture: best candidate '%s' below threshold (%.2f < %.2f)",
+		    best->name.c_str(), bestScore, threshold);
+	}
+
+	// Trail outcome: matched gesture breathes and dissolves, miss fades fast.
+	// Use the matched gesture's own color/style for the success flourish.
+	if (cast && best) {
+		// The completed rune flashes in its own color (falls back to the trail color)
+		s_trailRGB[0] = best->runeRGB[0];
+		s_trailRGB[1] = best->runeRGB[1];
+		s_trailRGB[2] = best->runeRGB[2];
+		s_trailWidth = best->trailWidth;
+		s_trailStyle = best->trailStyle;
+	}
+	s_trailPhase = TrailPhase::Fade;
+	s_trailSuccess = cast;
+	s_trailT0 = now;
+
+	// Trace loop ends with the hold; a successful cast gets its finish sound
+	StopTraceSound(cast);
+}
+
+// ─── Trail overlay rendering ─────────────────────────────────────────────
+// Draws the gesture as a glowing stroke on a compositor quad frozen at the
+// capture plane. Builds live under the hand; on success the finished shape
+// breathes (two glow swells) and dissolves, on a miss it fades out quietly.
+
+// Additive stamp with radial falloff into the RGBA8 buffer
+static void TrailStamp(float cx, float cy, float radius, const float rgb[3], float alpha)
+{
+	int x0 = std::max(0, (int)(cx - radius));
+	int x1 = std::min(kTrailTex - 1, (int)(cx + radius));
+	int y0 = std::max(0, (int)(cy - radius));
+	int y1 = std::min(kTrailTex - 1, (int)(cy + radius));
+	float r2 = radius * radius;
+	for (int y = y0; y <= y1; y++) {
+		for (int x = x0; x <= x1; x++) {
+			float dx = x - cx, dy = y - cy;
+			float d2 = dx * dx + dy * dy;
+			if (d2 > r2)
+				continue;
+			float fall = 1.0f - sqrtf(d2) / radius;
+			float a = alpha * fall * fall;
+			uint32_t& px = s_trailPixels[y * kTrailTex + x];
+			uint8_t* c = (uint8_t*)&px;
+			// RGBA8: additive, saturating
+			c[0] = (uint8_t)std::min(255.0f, c[0] + rgb[0] * a * 255.0f);
+			c[1] = (uint8_t)std::min(255.0f, c[1] + rgb[1] * a * 255.0f);
+			c[2] = (uint8_t)std::min(255.0f, c[2] + rgb[2] * a * 255.0f);
+			c[3] = (uint8_t)std::min(255.0f, c[3] + a * 255.0f);
+		}
+	}
+}
+
+static void RenderTrailTexture(float envelope)
+{
+	if (!s_trailPixels)
+		s_trailPixels = new uint32_t[kTrailTex * kTrailTex];
+	memset(s_trailPixels, 0, kTrailTex * kTrailTex * sizeof(uint32_t));
+
+	float master = envelope;
+	if (s_trailStyle & 1) // transparent
+		master *= 0.5f;
+	master = std::min(master, 1.9f); // headroom for the success pulse-flash
+	if (master <= 0.0f)
+		return;
+
+	const bool glow = (s_trailStyle & 8) != 0;
+	const bool smoky = (s_trailStyle & 2) != 0;
+	const bool wispy = (s_trailStyle & 4) != 0;
+
+	for (int h = 0; h < 2; h++) {
+		const auto& path = s_trailPath[h];
+		if (path.size() < 2)
+			continue;
+
+		int stamp = 0;
+		for (size_t i = 1; i < path.size(); i++) {
+			// Meters → texture pixels (quad center = capture origin)
+			float ax = (path[i - 1].x / kTrailQuadSize + 0.5f) * kTrailTex;
+			float ay = (path[i - 1].y / kTrailQuadSize + 0.5f) * kTrailTex;
+			float bx = (path[i].x / kTrailQuadSize + 0.5f) * kTrailTex;
+			float by = (path[i].y / kTrailQuadSize + 0.5f) * kTrailTex;
+			// Per-gesture thickness multiplier; spacing scales with it so the
+			// stamps keep the same overlap (CPU cost grows only linearly)
+			const float w = s_trailWidth;
+			float seg = hypotf(bx - ax, by - ay);
+			int steps = std::max(1, (int)(seg / (4.0f * w)));
+			for (int s = 0; s < steps; s++, stamp++) {
+				float t = (float)s / steps;
+				float px = ax + (bx - ax) * t;
+				float py = ay + (by - ay) * t;
+
+				if (glow) {
+					TrailStamp(px, py, 26.0f * w, s_trailRGB, 0.05f * master);
+					TrailStamp(px, py, 14.0f * w, s_trailRGB, 0.16f * master);
+					TrailStamp(px, py, 6.0f * w, s_trailRGB, 0.75f * master);
+				} else {
+					TrailStamp(px, py, 8.0f * w, s_trailRGB, 0.8f * master);
+				}
+				if (smoky) {
+					// Soft billow with deterministic jitter
+					uint32_t hsh = (uint32_t)(stamp * 2654435761u);
+					float jx = ((hsh & 0xFF) / 255.0f - 0.5f) * 18.0f * w;
+					float jy = (((hsh >> 8) & 0xFF) / 255.0f - 0.5f) * 18.0f * w;
+					TrailStamp(px + jx, py + jy, 26.0f * w, s_trailRGB, 0.030f * master);
+				}
+				if (wispy) {
+					// Thin strands weaving around the stroke
+					float wave = sinf(stamp * 0.35f) * 9.0f * w;
+					float dx = by - ay, dy = -(bx - ax);
+					float len = hypotf(dx, dy);
+					if (len > 0.01f) {
+						dx /= len;
+						dy /= len;
+						TrailStamp(px + dx * wave, py + dy * wave, 3.2f * w, s_trailRGB, 0.45f * master);
+						TrailStamp(px - dx * wave * 0.6f, py - dy * wave * 0.6f, 2.4f * w, s_trailRGB, 0.30f * master);
+					}
+				}
+			}
+		}
+
+		// Bright leading tip while drawing
+		if (s_trailPhase == TrailPhase::Drawing) {
+			float tx = (path.back().x / kTrailQuadSize + 0.5f) * kTrailTex;
+			float ty = (path.back().y / kTrailQuadSize + 0.5f) * kTrailTex;
+			const float white[3] = { 1.0f, 1.0f, 1.0f };
+			TrailStamp(tx, ty, 9.0f * s_trailWidth, white, 0.9f * std::min(1.0f, master));
+		}
+	}
+}
+
+static bool EnsureTrailResources()
+{
+	if (s_trailChain != XR_NULL_HANDLE)
+		return true;
+
+	XrSwapchainCreateInfo sci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+	sci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+	sci.format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	sci.sampleCount = 1;
+	sci.width = kTrailTex;
+	sci.height = kTrailTex;
+	sci.faceCount = 1;
+	sci.arraySize = 1;
+	sci.mipCount = 1;
+	if (XR_FAILED(xrCreateSwapchain(xr_session.get(), &sci, &s_trailChain))) {
+		s_trailChain = XR_NULL_HANDLE;
+		return false;
+	}
+
+	uint32_t count = 0;
+	xrEnumerateSwapchainImages(s_trailChain, 0, &count, nullptr);
+	s_trailImages.resize(count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
+	xrEnumerateSwapchainImages(s_trailChain, count, &count, (XrSwapchainImageBaseHeader*)s_trailImages.data());
+
+	memset(&s_trailLayer, 0, sizeof(s_trailLayer));
+	s_trailLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+	s_trailLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+	s_trailLayer.space = xr_gbl->floorSpace;
+	s_trailLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+	s_trailLayer.subImage.swapchain = s_trailChain;
+	s_trailLayer.subImage.imageRect.offset = { 0, 0 };
+	s_trailLayer.subImage.imageRect.extent = { kTrailTex, kTrailTex };
+	s_trailLayer.subImage.imageArrayIndex = 0;
+	s_trailLayer.size.width = kTrailQuadSize;
+	s_trailLayer.size.height = kTrailQuadSize;
+	OOVR_LOG("Gesture trail: overlay swapchain created");
+	return true;
+}
+
+// Called from _BuildLayers: renders the trail (when active) and appends its
+// quad to the layer list.
+static void AppendTrailLayer(std::vector<XrCompositionLayerBaseHeader*>& headers)
+{
+	if (s_trailPhase == TrailPhase::Idle)
+		return;
+
+	ULONGLONG now = GetTickCount64();
+	float envelope = 0.0f;
+
+	if (s_trailPhase == TrailPhase::Drawing) {
+		envelope = std::min(1.0f, (now - s_trailT0) / 150.0f); // quick fade-in
+	} else { // Fade
+		if (s_trailSuccess) {
+			// Pulse-flash: two hard swells over 1.6s while dissolving, timed
+			// to land with the finish sound ("woo... woo"). Each peak pushes
+			// the additive stamps into saturation so the stroke flashes white.
+			float t = (now - s_trailT0) / 1600.0f;
+			if (t >= 1.0f) {
+				s_trailPhase = TrailPhase::Idle;
+				return;
+			}
+			float pulse = 1.0f + 0.9f * sinf(t * 6.2831853f * 2.0f);
+			envelope = (1.0f - t * t) * pulse;
+		} else {
+			float t = (now - s_trailT0) / 280.0f;
+			if (t >= 1.0f) {
+				s_trailPhase = TrailPhase::Idle;
+				return;
+			}
+			envelope = 1.0f - t;
+		}
+	}
+
+	if (!BaseCompositor::dxcomp)
+		return;
+	ID3D11Device* dev = BaseCompositor::dxcomp->GetDevice();
+	if (!dev || reinterpret_cast<uintptr_t>(dev) <= 0xFFFF)
+		return;
+	if (!EnsureTrailResources())
+		return;
+
+	RenderTrailTexture(envelope);
+
+	// Upload: staging texture with init data, then copy into the acquired image
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = kTrailTex;
+	td.Height = kTrailTex;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	td.SampleDesc = { 1, 0 };
+	td.Usage = D3D11_USAGE_DEFAULT;
+	D3D11_SUBRESOURCE_DATA init = { s_trailPixels, sizeof(uint32_t) * kTrailTex, 0 };
+	ID3D11Texture2D* tex = nullptr;
+	if (FAILED(dev->CreateTexture2D(&td, &init, &tex)))
+		return;
+
+	ID3D11DeviceContext* ctx = nullptr;
+	dev->GetImmediateContext(&ctx);
+	if (ctx) {
+		XrSwapchainImageAcquireInfo acq = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		uint32_t idx = 0;
+		if (XR_SUCCEEDED(xrAcquireSwapchainImage(s_trailChain, &acq, &idx))) {
+			XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+			wait.timeout = 500000000;
+			if (XR_SUCCEEDED(xrWaitSwapchainImage(s_trailChain, &wait))) {
+				if (idx < s_trailImages.size())
+					ctx->CopyResource(s_trailImages[idx].texture, tex);
+			}
+			XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+			xrReleaseSwapchainImage(s_trailChain, &rel);
+
+			s_trailLayer.pose = s_trailPose;
+			headers.push_back((XrCompositionLayerBaseHeader*)&s_trailLayer);
+		}
+		ctx->Release();
+	}
+	tex->Release();
+}
+
+} // namespace gestures
 #endif
 
 int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompositionLayerBaseHeader const* const*& layers)
@@ -722,7 +1819,7 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 				}
 			}
 
-			if (!requirements.empty()) {
+			if (!requirements.empty() || s_shortcutTrackpad != "none") {
 				// Get controller states using proper hand assignments (not hardcoded indices)
 				VRControllerState_t ctrlState[2] = {};
 				bool ctrlValid[2] = { false, false };
@@ -733,8 +1830,10 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 				if (rightIdx != k_unTrackedDeviceIndexInvalid)
 					ctrlValid[1] = sys->GetControllerState(rightIdx, &ctrlState[1], sizeof(ctrlState[1]));
 
-				// Check ALL required buttons are pressed simultaneously
-				bool btnPressed = true;
+				// Check ALL required buttons are pressed simultaneously.
+				// Empty requirements (trackpad-only shortcut) must never count
+				// as pressed or the tap detector would fire on its own.
+				bool btnPressed = !requirements.empty();
 				for (const auto& req : requirements) {
 					int idx = req.ctrl; // 0=left, 1=right
 					if (!ctrlValid[idx]) {
@@ -796,6 +1895,40 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 					}
 					if (shortcutTapCount > 0 && (GetTickCount64() - shortcutPressTime[shortcutTapCount - 1]) > (ULONGLONG)timing) {
 						shortcutTapCount = 0;
+					}
+				}
+
+				// Index trackpad swipe: thumb lands, slides most of the pad
+				// height within the time window, either hand. GetControllerState
+				// above refreshed the exported trackpad values this frame.
+				// Fires once per touch so holding the thumb cannot re-trigger.
+				if (!activate && s_shortcutTrackpad != "none") {
+					extern float g_ocuTrackpadY[2];
+					extern bool g_ocuTrackpadTouch[2];
+					static bool swipeTouchWas[2] = { false, false };
+					static bool swipeFired[2] = { false, false };
+					static float swipeStartY[2] = { 0, 0 };
+					static ULONGLONG swipeStartT[2] = { 0, 0 };
+					const bool wantUp = (s_shortcutTrackpad == "swipe_up");
+					for (int h = 0; h < 2; h++) {
+						bool touch = g_ocuTrackpadTouch[h];
+						float ty = g_ocuTrackpadY[h];
+						if (touch && !swipeTouchWas[h]) {
+							swipeStartY[h] = ty;
+							swipeStartT[h] = GetTickCount64();
+							swipeFired[h] = false;
+						} else if (touch && !swipeFired[h]) {
+							float dy = ty - swipeStartY[h];
+							if ((ULONGLONG)(GetTickCount64() - swipeStartT[h]) <= 450) {
+								if ((wantUp && dy >= 0.8f) || (!wantUp && dy <= -0.8f)) {
+									activate = true;
+									swipeFired[h] = true;
+									OOVR_LOGF("Keyboard shortcut: trackpad swipe %s (hand=%d dy=%.2f)",
+									    wantUp ? "up" : "down", h, dy);
+								}
+							}
+						}
+						swipeTouchWas[h] = touch;
 					}
 				}
 
@@ -961,6 +2094,14 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 			autoOpenedKeyboard = false;
 		}
 	}
+
+	// Gesture recognizer: capture hand motion while a gesture's hold button is
+	// down, match and fire the bound key on release. Paused while typing.
+	{
+		BaseSystem* gsys = GetUnsafeBaseSystem();
+		if (gsys)
+			gestures::Update(gsys, keyboard != nullptr);
+	}
 #endif
 
 	if (keyboard) {
@@ -983,6 +2124,12 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 		g_kbLaserConsumesTrigger[0] = false;
 		g_kbLaserConsumesTrigger[1] = false;
 	}
+
+#ifdef _WIN32
+	// Gesture trail overlay: renders while drawing and through the
+	// breathe-and-dissolve after release
+	gestures::AppendTrailLayer(layerHeaders);
+#endif
 
 // =========================================================================
 // [EXPERIMENTAL — DISABLED] MCM Menu Laser Pointer System
